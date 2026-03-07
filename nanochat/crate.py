@@ -67,6 +67,7 @@ class CRATEConfig:
     ista_step_size: float = 0.1   # Step size η (used if odl_use_relu=False)
     ista_lambda: float = 0.1      # Sparsity threshold λ (used if odl_use_relu=False)
     ista_mode: str = 'relu'       # 'soft_threshold' or 'relu'
+    sparse_block_type: str = "odl"  # "odl" (CRATE-alpha) or "ista" (legacy checkpoints)
 
 
 # =============================================================================
@@ -141,8 +142,8 @@ class MSSA(nn.Module):
         w_new = apply_rotary_emb(w_new, cos, sin)
         w_new = norm(w_new)  # QK norm (like nanochat)
         
-        # Handle KV cache for inference
         if kv_cache is not None:
+            # Inference path: manual attention with KV cache
             pos = kv_cache.get_pos()
             k_cache, _ = kv_cache.get_layer_cache(self.layer_idx)
             k_cache[:, pos:pos + T, :, :] = w_new
@@ -151,37 +152,42 @@ class MSSA(nn.Module):
             T_k = w_kv.size(1)
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
+            
+            w_q = w_q.transpose(1, 2)    # [B, H, T, D]
+            w_kv = w_kv.transpose(1, 2)  # [B, H, T_k, D]
+            
+            dots = torch.matmul(w_q, w_kv.transpose(-1, -2)) * self.scale
+            causal_mask = torch.triu(
+                torch.ones(T, T_k, dtype=torch.bool, device=x.device),
+                diagonal=T_k - T + 1
+            )
+            dots = dots.masked_fill(causal_mask, float('-inf'))
+            window_left, _ = window_size
+            if 0 < window_left < T_k:
+                positions = torch.arange(T_k, device=x.device)
+                query_positions = torch.arange(T, device=x.device) + (T_k - T)
+                distance = query_positions.unsqueeze(1) - positions.unsqueeze(0)
+                window_mask = distance > window_left
+                dots = dots.masked_fill(window_mask, float('-inf'))
+            attn = F.softmax(dots, dim=-1)
+            out = torch.matmul(attn, w_kv)
         else:
-            w_q = w_new
-            w_kv = w_new
-            T_k = T
+            # Training path: fused SDPA (dispatches to Flash/MemEfficient kernels)
+            w = w_new.transpose(1, 2)  # [B, H, T, D]
+            window_left, _ = window_size
+            if 0 < window_left < T:
+                # Sliding window: combined causal + window mask (float: 0=attend, -inf=masked)
+                mask = torch.zeros(T, T, device=x.device, dtype=w.dtype)
+                causal = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
+                mask.masked_fill_(causal, float('-inf'))
+                positions = torch.arange(T, device=x.device)
+                distance = positions.unsqueeze(0) - positions.unsqueeze(1)
+                mask.masked_fill_(distance > window_left, float('-inf'))
+                out = F.scaled_dot_product_attention(w, w, w, attn_mask=mask, scale=self.scale)
+            else:
+                # Full context: pure causal → Flash Attention kernel
+                out = F.scaled_dot_product_attention(w, w, w, is_causal=True, scale=self.scale)
         
-        # Rearrange for attention: [B, H, T, D]
-        w_q = w_q.transpose(1, 2)
-        w_kv = w_kv.transpose(1, 2)
-        
-        # Attention
-        dots = torch.matmul(w_q, w_kv.transpose(-1, -2)) * self.scale
-        
-        # Causal mask
-        causal_mask = torch.triu(
-            torch.ones(T, T_k, dtype=torch.bool, device=x.device),
-            diagonal=T_k - T + 1
-        )
-        dots = dots.masked_fill(causal_mask, float('-inf'))
-        
-        # Sliding window mask
-        window_left, _ = window_size
-        if 0 < window_left < T_k:
-            positions = torch.arange(T_k, device=x.device)
-            query_positions = torch.arange(T, device=x.device) + (T_k - T)
-            distance = query_positions.unsqueeze(1) - positions.unsqueeze(0)
-            window_mask = distance > window_left
-            dots = dots.masked_fill(window_mask, float('-inf'))
-        
-        attn = F.softmax(dots, dim=-1)
-        
-        out = torch.matmul(attn, w_kv)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         out = self.c_proj(out)
         
@@ -317,23 +323,27 @@ class Block(nn.Module):
     def __init__(self, config: CRATEConfig, layer_idx: int):
         super().__init__()
         self.use_residual = config.odl_use_residual
+        self.sparse_block_type = config.sparse_block_type
         
         # Compression block (MSSA)
         self.mssa = MSSA(config, layer_idx)
         
-        # Sparsification block (ODL for CRATE-α, ISTA for vanilla)
-        self.odl = ODL(config)
+        # Sparsification block (ODL for CRATE-alpha, ISTA for legacy checkpoints)
+        if self.sparse_block_type == "ista":
+            self.ista = ISTA(config)
+        else:
+            self.odl = ODL(config)
     
     def forward(self, x: torch.Tensor, cos_sin, window_size, kv_cache) -> torch.Tensor:
         # Compression (MSSA with residual)
         x = x + self.mssa(norm(x), cos_sin, window_size, kv_cache)
         
-        # Sparsification (ODL with residual - THE KEY CHANGE FOR SCALING!)
+        # Sparsification block (module chosen by sparse_block_type)
+        sparse_module = self.ista if self.sparse_block_type == "ista" else self.odl
         if self.use_residual:
-            x = x + self.odl(norm(x))
+            x = x + sparse_module(norm(x))
         else:
-            # Vanilla CRATE behavior (doesn't scale well)
-            x = self.odl(norm(x))
+            x = sparse_module(norm(x))
         
         return x
 
@@ -451,11 +461,14 @@ class CRATE(nn.Module):
             torch.nn.init.uniform_(block.mssa.qkv.weight, -s, s)
             torch.nn.init.zeros_(block.mssa.c_proj.weight)
             
-            # ODL (CRATE-α style initialization)
-            # Initialize similar to standard transformer MLP
-            torch.nn.init.kaiming_uniform_(block.odl.D_enc.weight, a=5**0.5)
-            torch.nn.init.zeros_(block.odl.D_dec.weight)
-            torch.nn.init.zeros_(block.odl.threshold)
+            if hasattr(block, "odl"):
+                # ODL (CRATE-alpha style initialization)
+                torch.nn.init.kaiming_uniform_(block.odl.D_enc.weight, a=5**0.5)
+                torch.nn.init.zeros_(block.odl.D_dec.weight)
+                torch.nn.init.zeros_(block.odl.threshold)
+            else:
+                # Legacy ISTA initialization
+                torch.nn.init.kaiming_uniform_(block.ista.weight, a=5**0.5)
         
         # Per-layer scalars
         with torch.no_grad():

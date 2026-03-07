@@ -39,6 +39,19 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+def _uses_crate_architecture(model_data):
+    # CRATE checkpoints use mssa/(odl|ista) module names instead of attn/mlp.
+    return any(".mssa." in key or ".odl." in key or ".ista." in key for key in model_data.keys())
+
+def _detect_sparse_block_type(model_data):
+    # Newer CRATE-alpha checkpoints store ODL parameters.
+    if any(".odl." in key for key in model_data.keys()):
+        return "odl"
+    # Legacy CRATE checkpoints used ISTA weights.
+    if any(".ista." in key for key in model_data.keys()):
+        return "ista"
+    return "odl"
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -94,11 +107,31 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
+    # Fix vocab_size if the metadata disagrees with the actual embedding weights.
+    # This can happen when mid_train.py saves tokenizer.get_vocab_size() instead
+    # of model.config.vocab_size.
+    wte_key = next((k for k in model_data if k.endswith("wte.weight")), None)
+    if wte_key is not None:
+        actual_vocab = model_data[wte_key].shape[0]
+        if model_config_kwargs.get("vocab_size") != actual_vocab:
+            log0(f"Patching vocab_size: meta says {model_config_kwargs.get('vocab_size')}, weights say {actual_vocab}")
+            model_config_kwargs["vocab_size"] = actual_vocab
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
+    if _uses_crate_architecture(model_data):
+        from nanochat.crate import CRATE, CRATEConfig
+        model_class, model_config_class = CRATE, CRATEConfig
+        arch_name = "CRATE"
+        sparse_block_type = _detect_sparse_block_type(model_data)
+        model_config_kwargs.setdefault("sparse_block_type", sparse_block_type)
+        log0(f"Detected CRATE sparse block type: {sparse_block_type}")
+    else:
+        model_class, model_config_class = GPT, GPTConfig
+        arch_name = "GPT"
+    log0(f"Detected checkpoint architecture: {arch_name}")
+    model_config = model_config_class(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = model_class(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
@@ -110,8 +143,19 @@ def build_model(checkpoint_dir, step, device, phase):
         model.train()
     # Load the Tokenizer
     tokenizer = get_tokenizer()
-    # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"]
+    # Sanity checks: compatibility between model and tokenizer
+    tokenizer_vocab_size = tokenizer.get_vocab_size()
+    model_vocab_size = model_config_kwargs["vocab_size"]
+    if tokenizer_vocab_size > model_vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab ({tokenizer_vocab_size}) is larger than model vocab ({model_vocab_size}). "
+            "This checkpoint likely needs an older/smaller tokenizer snapshot."
+        )
+    if tokenizer_vocab_size < model_vocab_size:
+        log0(
+            f"Tokenizer vocab ({tokenizer_vocab_size}) is smaller than model vocab ({model_vocab_size}); "
+            "continuing with tokenizer-limited coverage."
+        )
     return model, tokenizer, meta_data
 
 
@@ -167,6 +211,10 @@ def load_model(source, *args, **kwargs):
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
+        "semisup": "semisup_checkpoints",
+        "semisup_code": "semisup_code_checkpoints",
+        "semisup_general": "semisup_general_checkpoints",
+        "semisup_math": "semisup_math_checkpoints",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)

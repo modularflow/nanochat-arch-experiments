@@ -253,7 +253,12 @@ class RustBPETokenizer:
         return self.encode(*args, **kwargs)
 
     def decode(self, ids):
-        return self.enc.decode(ids)
+        # Filter out special token IDs that tiktoken can't decode.
+        # Special tokens live at the end of the vocab, above the mergeable range.
+        num_specials = len(self.enc.special_tokens_set)
+        max_mergeable = self.enc.n_vocab - num_specials
+        clean = [t for t in ids if t < max_mergeable]
+        return self.enc.decode(clean)
 
     def save(self, tokenizer_dir):
         # save the encoding object to disk
