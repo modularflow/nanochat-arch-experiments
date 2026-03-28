@@ -125,6 +125,11 @@ def sft_data_generator(dataset, batch_size):
         for i in range(ddp_rank, len(dataset), ddp_world_size):
             doc = dataset[i]
             ids, mask = tokenizer.render_conversation(doc)
+            # Some long conversations get truncated before any supervised
+            # assistant tokens remain. Those produce all -1 targets and
+            # cross-entropy returns nan, so skip them here.
+            if sum(mask[1:]) == 0:
+                continue
             batch.append((ids, mask))
             if len(batch) == batch_size:
                 yield collate_and_yield(batch)

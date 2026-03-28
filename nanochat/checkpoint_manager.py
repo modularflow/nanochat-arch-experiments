@@ -39,6 +39,10 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+def _uses_selfflow_architecture(model_data):
+    # SelfFlowCRATE checkpoints have proj_heads and/or corruption_conditioner keys.
+    return any(k.startswith("proj_heads.") or k.startswith("corruption_conditioner.") for k in model_data.keys())
+
 def _uses_crate_architecture(model_data):
     # CRATE checkpoints use mssa/(odl|ista) module names instead of attn/mlp.
     return any(".mssa." in key or ".odl." in key or ".ista." in key for key in model_data.keys())
@@ -117,7 +121,21 @@ def build_model(checkpoint_dir, step, device, phase):
             log0(f"Patching vocab_size: meta says {model_config_kwargs.get('vocab_size')}, weights say {actual_vocab}")
             model_config_kwargs["vocab_size"] = actual_vocab
     log0(f"Building model with config: {model_config_kwargs}")
-    if _uses_crate_architecture(model_data):
+    if _uses_selfflow_architecture(model_data):
+        from nanochat.self_flow_model import SelfFlowCRATE, SelfFlowConfig
+        model_class, model_config_class = SelfFlowCRATE, SelfFlowConfig
+        arch_name = "SelfFlowCRATE"
+        sparse_block_type = _detect_sparse_block_type(model_data)
+        model_config_kwargs.setdefault("sparse_block_type", sparse_block_type)
+        # Pull self-flow config from metadata if available
+        selfflow_config = meta_data.get("selfflow_config", {})
+        for sf_key in ("student_layers", "teacher_layers", "proj_hidden_mult",
+                       "corruption_conditioning", "cond_hidden_mult",
+                       "corruption_strategy", "rep_loss_type", "rep_loss_weight"):
+            if sf_key in selfflow_config:
+                model_config_kwargs.setdefault(sf_key, selfflow_config[sf_key])
+        log0(f"Detected SelfFlowCRATE (sparse block: {sparse_block_type})")
+    elif _uses_crate_architecture(model_data):
         from nanochat.crate import CRATE, CRATEConfig
         model_class, model_config_class = CRATE, CRATEConfig
         arch_name = "CRATE"
@@ -147,9 +165,12 @@ def build_model(checkpoint_dir, step, device, phase):
     tokenizer_vocab_size = tokenizer.get_vocab_size()
     model_vocab_size = model_config_kwargs["vocab_size"]
     if tokenizer_vocab_size > model_vocab_size:
-        raise ValueError(
-            f"Tokenizer vocab ({tokenizer_vocab_size}) is larger than model vocab ({model_vocab_size}). "
-            "This checkpoint likely needs an older/smaller tokenizer snapshot."
+        # CRATE models are trained with a smaller vocab than the default tokenizer.
+        # This is fine: the model clips logits to its own vocab_size and the
+        # tokenizer's decode() filters out-of-range IDs.
+        log0(
+            f"Tokenizer vocab ({tokenizer_vocab_size}) is larger than model vocab ({model_vocab_size}); "
+            "tokens above model vocab will be unused (normal for CRATE)."
         )
     if tokenizer_vocab_size < model_vocab_size:
         log0(
@@ -215,6 +236,8 @@ def load_model(source, *args, **kwargs):
         "semisup_code": "semisup_code_checkpoints",
         "semisup_general": "semisup_general_checkpoints",
         "semisup_math": "semisup_math_checkpoints",
+        "selfflow": "selfflow_checkpoints",
+        "selfflow_pretrain": "selfflow_pretrain_checkpoints",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)

@@ -45,11 +45,13 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_model(model, tokenizer, device, max_per_task=-1):
+def evaluate_model(model, tokenizer, device, max_per_task=-1, exclude_tasks=None):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
+    - exclude_tasks: set of task labels to skip (e.g. {"arc_easy", "arc_challenge", "openbook_qa"})
     """
+    exclude_tasks = exclude_tasks or set()
     # Load config and task metadata
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
@@ -76,8 +78,11 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
     results = {}
     centered_results = {}
     for task in tasks:
-        start_time = time.time()
         label = task['label']
+        if label in exclude_tasks:
+            print0(f"Skipping excluded task: {label}")
+            continue
+        start_time = time.time()
         task_meta = {
             'task_type': task['icl_task_type'],
             'dataset_uri': task['dataset_uri'],

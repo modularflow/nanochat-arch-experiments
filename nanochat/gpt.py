@@ -23,13 +23,22 @@ from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
-# Load Flash Attention 3 from HuggingFace Hub (and silence the progress bar)
+# Attention backend selection: FA3 on Hopper (SM 90+), SDPA elsewhere (e.g. 4090 / Ada SM 89)
 import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-# Official docs of FA3 label it as "beta" and want you to install FA3 from source, which is a pain.
-# Wishing for official FA3 wheels soon, for now this seems to be a fast way to get them (ty varunneal)
-from kernels import get_kernel
-flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+_USE_FA3 = False
+flash_attn = None
+if torch.cuda.is_available():
+    _major, _minor = torch.cuda.get_device_capability()
+    if _major >= 9:
+        try:
+            from kernels import get_kernel
+            flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+            _USE_FA3 = True
+        except Exception:
+            pass
+if not _USE_FA3:
+    print(f"[gpt.py] Flash Attention 3 not available; using PyTorch SDPA fallback.")
 
 @dataclass
 class GPTConfig:
@@ -76,41 +85,84 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        q, k = norm(q), norm(k)
 
-        # Attention with Flash Attention 3
-        # FA3 handles GQA automatically when n_kv_heads < n_heads
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if _USE_FA3:
+            y = self._forward_fa3(q, k, v, window_size, kv_cache, B, T)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            y = self._forward_sdpa(q, k, v, window_size, kv_cache, B, T)
 
-        # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
+
+    def _forward_fa3(self, q, k, v, window_size, kv_cache, B, T):
+        if kv_cache is None:
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+        y = flash_attn.flash_attn_with_kvcache(
+            q, k_cache, v_cache,
+            k=k, v=v,
+            cache_seqlens=kv_cache.cache_seqlens,
+            causal=True,
+            window_size=window_size,
+        )
+        if self.layer_idx == kv_cache.n_layers - 1:
+            kv_cache.advance(T)
+        return y
+
+    def _forward_sdpa(self, q, k, v, window_size, kv_cache, B, T):
+        """SDPA fallback for non-Hopper GPUs (e.g. RTX 4090 Ada Lovelace)."""
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            pos = kv_cache.cache_seqlens[0].item()
+            k_cache[:, pos:pos + T] = k
+            v_cache[:, pos:pos + T] = v
+            k_full = k_cache[:, :pos + T]
+            v_full = v_cache[:, :pos + T]
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+        else:
+            k_full = k
+            v_full = v
+
+        # GQA: repeat k/v heads to match q heads
+        if self.n_kv_head < self.n_head:
+            rep = self.n_head // self.n_kv_head
+            k_full = k_full.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, k_full.size(1), self.n_head, self.head_dim)
+            v_full = v_full.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, v_full.size(1), self.n_head, self.head_dim)
+
+        # SDPA expects (B, H, T, D)
+        q_sdpa = q.transpose(1, 2)
+        k_sdpa = k_full.transpose(1, 2)
+        v_sdpa = v_full.transpose(1, 2)
+
+        is_causal = (kv_cache is None) and (T > 1)
+
+        # Sliding window via additive attention mask
+        attn_mask = None
+        if window_size is not None and window_size[0] > 0 and kv_cache is None:
+            left = window_size[0]
+            S = k_sdpa.size(-2)
+            row_idx = torch.arange(T, device=q.device).unsqueeze(1)
+            col_idx = torch.arange(S, device=q.device).unsqueeze(0)
+            causal_mask = col_idx <= row_idx
+            window_mask = (row_idx - col_idx) <= left
+            attn_mask = causal_mask & window_mask
+            is_causal = False
+
+        y = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+        )
+        return y.transpose(1, 2)
 
 
 class MLP(nn.Module):
@@ -147,6 +199,7 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.max_seq_len = config.sequence_len
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)

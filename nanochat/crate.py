@@ -19,7 +19,7 @@ References:
 
 from functools import partial
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -396,6 +396,7 @@ class CRATE(nn.Module):
     def __init__(self, config: CRATEConfig, pad_vocab_size_to: int = 64):
         super().__init__()
         self.config = config
+        self.max_seq_len = config.sequence_len
         
         # Compute window sizes
         self.window_sizes = self._compute_window_sizes(config)
@@ -558,8 +559,18 @@ class CRATE(nn.Module):
         return optimizers
     
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, 
-                kv_cache=None, loss_reduction: str = 'mean') -> torch.Tensor:
-        """Forward pass."""
+                kv_cache=None, loss_reduction: str = 'mean',
+                return_hidden_at: Optional[Union[int, List[int]]] = None,
+                embedding_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            return_hidden_at: Layer index (or list of indices) at which to
+                snapshot hidden states. When an int, returns (output, hidden).
+                When a list, returns (output, {layer_idx: hidden, ...}).
+            embedding_bias: Optional [B, T, d] tensor added to embeddings
+                after RMSNorm (used by Self-Flow for corruption conditioning).
+        """
         B, T = idx.size()
         
         # RoPE
@@ -570,11 +581,25 @@ class CRATE(nn.Module):
         # Forward the transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        if embedding_bias is not None:
+            x = x + embedding_bias
         x0 = x
+
+        # Normalize return_hidden_at to a set for O(1) lookup
+        if return_hidden_at is not None:
+            multi_layer = isinstance(return_hidden_at, (list, tuple))
+            target_layers = set(return_hidden_at) if multi_layer else {return_hidden_at}
+            hidden_snapshots: Dict[int, torch.Tensor] = {}
+        else:
+            multi_layer = False
+            target_layers = set()
+            hidden_snapshots = {}
         
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+            if i in target_layers:
+                hidden_snapshots[i] = x
         
         x = norm(x)
         
@@ -584,22 +609,29 @@ class CRATE(nn.Module):
         logits = logits[..., :self.config.vocab_size]
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
-        
+
+        # Compute output (loss or logits)
         if targets is not None:
-            loss = F.cross_entropy(
+            output = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), 
                 targets.view(-1),
                 ignore_index=-1,
                 reduction=loss_reduction
             )
-            return loss
-        
-        return logits
+        else:
+            output = logits
+
+        if return_hidden_at is not None:
+            if multi_layer:
+                return output, hidden_snapshots
+            else:
+                return output, hidden_snapshots.get(return_hidden_at)
+        return output
     
     @torch.inference_mode()
     def generate(self, tokens: list, max_tokens: int, temperature: float = 1.0, 
                  top_k: Optional[int] = None, seed: int = 42):
-        """Generate tokens."""
+        """Generate tokens with KV cache for O(n) generation."""
         assert isinstance(tokens, list)
         device = self.get_device()
         rng = None
@@ -607,12 +639,20 @@ class CRATE(nn.Module):
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         
+        cache = KVCache(
+            batch_size=1,
+            num_heads=self.config.n_head,
+            seq_len=len(tokens) + max_tokens,
+            head_dim=self.config.n_embd // self.config.n_head,
+            num_layers=self.config.n_layer,
+            device=device,
+        )
+        
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits = self.forward(ids, kv_cache=cache)
+        logits = logits[:, -1, :]
         
         for _ in range(max_tokens):
-            logits = self.forward(ids)
-            logits = logits[:, -1, :]
-            
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
@@ -624,9 +664,10 @@ class CRATE(nn.Module):
             else:
                 next_ids = torch.argmax(logits, dim=-1, keepdim=True)
             
-            ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+            logits = self.forward(next_ids, kv_cache=cache)
+            logits = logits[:, -1, :]
 
 
 # =============================================================================

@@ -29,6 +29,10 @@ from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, get_base_dir, get_dist_info, print0, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import load_model, save_checkpoint
 from nanochat.engine import Engine
+from nanochat.jepa import (
+    get_backbone, ensure_pred_token_slot,
+    compute_jepa_loss, extract_last_turn_views,
+)
 from nanochat.self_training import (
     PromptSource,
     PseudoLabelDataset,
@@ -78,6 +82,10 @@ parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learnin
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init-lr-frac", type=float, default=0.02, help="initial LR as fraction of base LR")
+# JEPA auxiliary loss
+parser.add_argument("--jepa-lambda", type=float, default=0.0, help="weight of JEPA loss (0 = disabled, recommend 0.1-0.25)")
+parser.add_argument("--jepa-dropout", type=float, default=0.5, help="fraction of micro-batches to skip JEPA")
+parser.add_argument("--jepa-view-max-len", type=int, default=256, help="max tokens per JEPA view to avoid OOM")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=50, help="evaluate val loss every N training steps")
 parser.add_argument("--eval-steps", type=int, default=50, help="number of batches for val loss evaluation")
@@ -106,6 +114,18 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-se
 model, tokenizer, meta = load_model(args.source, device, phase="train", model_tag=args.model_tag, step=args.model_step)
 orig_model = model
 engine = Engine(model, tokenizer)
+
+# JEPA setup
+use_jepa = args.jepa_lambda > 0.0
+assert 0.0 <= args.jepa_dropout <= 1.0
+PRED_TOKEN_ID = None
+USER_START_ID = None
+ASSISTANT_START_ID = None
+if use_jepa:
+    PRED_TOKEN_ID = ensure_pred_token_slot(orig_model, tokenizer, device)
+    USER_START_ID = tokenizer.encode_special("<|user_start|>")
+    ASSISTANT_START_ID = tokenizer.encode_special("<|assistant_start|>")
+    print0(f"JEPA enabled: lambda={args.jepa_lambda}, dropout={args.jepa_dropout}, view_max_len={args.jepa_view_max_len}")
 
 # Fingerprint the loaded checkpoint so we can detect stale candidate caches.
 # If the source model changes (e.g. re-trained), cached candidates from an
@@ -279,16 +299,63 @@ def run_train_phase(pseudo_label_dataset, iteration_idx):
 
         # Forward/backward with gradient accumulation
         num_tokens = torch.tensor(0, device=device)
+        step_jepa_loss = torch.tensor(0.0, device=device)
+        step_jepa_count = torch.tensor(0, device=device)
         for micro_step in range(grad_accum_steps):
             train_inputs, train_targets = next(train_loader)
             with autocast_ctx:
-                loss = model(train_inputs, train_targets)
-            train_loss = loss.detach()
-            loss = loss / grad_accum_steps
+                llm_loss = model(train_inputs, train_targets)
+                total_loss = llm_loss
+
+            if use_jepa:
+                should_jepa = torch.zeros(1, device=device)
+                if master_process:
+                    should_jepa.fill_(1.0 if torch.rand(1).item() >= args.jepa_dropout else 0.0)
+                if ddp:
+                    dist.broadcast(should_jepa, src=0)
+
+                if should_jepa.item() > 0.5:
+                    with autocast_ctx:
+                        jepa_loss_accum = torch.tensor(0.0, device=device)
+                        jepa_pair_count = 0
+
+                        for b in range(train_inputs.shape[0]):
+                            seq = train_inputs[b]
+                            user_ids, assistant_ids = extract_last_turn_views(
+                                seq, USER_START_ID, ASSISTANT_START_ID
+                            )
+                            if user_ids is None or assistant_ids is None:
+                                continue
+
+                            user_ids = user_ids[-args.jepa_view_max_len:]
+                            assistant_ids = assistant_ids[:args.jepa_view_max_len]
+
+                            j_loss = compute_jepa_loss(
+                                orig_model, user_ids, assistant_ids, PRED_TOKEN_ID, device
+                            )
+                            jepa_loss_accum = jepa_loss_accum + j_loss
+                            jepa_pair_count += 1
+
+                        if jepa_pair_count > 0:
+                            jepa_loss_mean = jepa_loss_accum / jepa_pair_count
+                            total_loss = llm_loss + args.jepa_lambda * jepa_loss_mean
+                            step_jepa_loss = step_jepa_loss + jepa_loss_mean.detach()
+                            step_jepa_count = step_jepa_count + 1
+
+            train_loss = llm_loss.detach()
+            loss = total_loss / grad_accum_steps
             loss.backward()
             num_tokens += (train_targets >= 0).sum()
         if ddp:
             dist.all_reduce(num_tokens, op=dist.ReduceOp.SUM)
+
+        if use_jepa and ddp:
+            dist.all_reduce(step_jepa_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(step_jepa_count, op=dist.ReduceOp.SUM)
+
+        jepa_loss_log = None
+        if use_jepa and step_jepa_count.item() > 0:
+            jepa_loss_log = (step_jepa_loss / step_jepa_count).item()
 
         # LR schedule
         lrm = get_lr_multiplier(step)
@@ -303,14 +370,18 @@ def run_train_phase(pseudo_label_dataset, iteration_idx):
 
         train_loss_item = train_loss.item()
         num_tokens_item = num_tokens.item()
-        print0(f"  [Iter {iteration_idx}] Step {step:05d}/{num_train_steps:05d} | Train loss: {train_loss_item:.6f} | lrm: {lrm:.6f} | tokens: {num_tokens_item:,}")
-        wandb_run.log({
+        jepa_str = f" | jepa: {jepa_loss_log:.4f}" if jepa_loss_log is not None else (" | jepa: skip" if use_jepa else "")
+        print0(f"  [Iter {iteration_idx}] Step {step:05d}/{num_train_steps:05d} | Train loss: {train_loss_item:.6f}{jepa_str} | lrm: {lrm:.6f} | tokens: {num_tokens_item:,}")
+        log_data = {
             "iteration": iteration_idx,
             "train_step": step,
             "lrm": lrm,
             "train_loss": train_loss_item,
             "num_tokens": num_tokens_item,
-        })
+        }
+        if jepa_loss_log is not None:
+            log_data["jepa_loss"] = jepa_loss_log
+        wandb_run.log(log_data)
 
     # Explicitly free optimizer state (momentum buffers) to reclaim VRAM
     for opt in optimizers:

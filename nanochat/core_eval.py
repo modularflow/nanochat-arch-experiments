@@ -246,13 +246,21 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
     """
+    import sys
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    n_total = len(range(rank, len(data), world_size))
+    log_every = max(1, n_total // 20)
     # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
+    for count, idx in enumerate(range(rank, len(data), world_size)):
         is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
         correct[idx] = float(is_correct)
+        if rank == 0 and (count + 1) % log_every == 0:
+            pct = 100.0 * (count + 1) / n_total
+            print(f"\rRank 0 | {count+1}/{n_total} ({pct:.0f}%)", end="", flush=True)
+    if rank == 0 and n_total > log_every:
+        print()
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()

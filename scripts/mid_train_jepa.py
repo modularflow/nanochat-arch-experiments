@@ -1,38 +1,49 @@
 """
-Midtrain the model. Same as pretraining but simpler.
+Midtrain the model with an auxiliary JEPA loss. Same as midtraining but with
+an additional embedding-prediction objective over natural user/assistant pairs.
 Run as:
 
-python -m scripts.mid_train
+python -m scripts.mid_train_jepa
 
 Or torchrun for training:
 
-torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device-batch-size=16
+torchrun --standalone --nproc_per_node=8 -m scripts.mid_train_jepa -- --device-batch-size=16
 """
 
 import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
-import wandb
-import torch
 from contextlib import nullcontext
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
-from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.checkpoint_manager import load_model
-import torch.distributed as dist
 
+import torch
+import torch.distributed as dist
+import wandb
+
+from nanochat.checkpoint_manager import load_model
+from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.common import compute_cleanup, compute_init, print0, DummyWandb, get_base_dir, autodetect_device_type
+from nanochat.loss_eval import evaluate_bpb
+from nanochat.tokenizer import get_token_bytes
+from nanochat.jepa import (
+    get_backbone, ensure_pred_token_slot,
+    compute_jepa_loss, extract_last_turn_views,
+    get_jepa_lambda, JEPA_SCHEDULES,
+)
 from tasks.common import TaskMixture
+from tasks.customjson import CustomJSON
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
-from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+
+USER_START_TOKEN = "<|user_start|>"
+ASSISTANT_START_TOKEN = "<|assistant_start|>"
+
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Midtrain the model")
+parser = argparse.ArgumentParser(description="Midtrain the model with an auxiliary JEPA loss")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -54,6 +65,11 @@ parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learnin
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init-lr-frac", type=float, default=1.0, help="initial LR as fraction of base LR")
+parser.add_argument("--jepa-lambda", type=float, default=0.25, help="weight of JEPA loss (0 = disabled)")
+parser.add_argument("--jepa-schedule", type=str, default="constant", choices=JEPA_SCHEDULES,
+    help="Lambda schedule: constant (default), linear_decay (→0), cosine_decay (→0)")
+parser.add_argument("--jepa-dropout", type=float, default=0.5, help="fraction of micro-batches to skip JEPA")
+parser.add_argument("--jepa-view-max-len", type=int, default=256, help="max tokens per view to avoid OOM")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
@@ -61,6 +77,9 @@ parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number o
 parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
 user_config = vars(args).copy()
+use_jepa = args.jepa_lambda > 0.0
+jepa_schedule = args.jepa_schedule
+assert 0.0 <= args.jepa_dropout <= 1.0
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -82,6 +101,14 @@ pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?")
 orig_model = model
+if use_jepa:
+    PRED_TOKEN_ID = ensure_pred_token_slot(orig_model, tokenizer, device)
+    USER_START_ID = tokenizer.encode_special(USER_START_TOKEN)
+    ASSISTANT_START_ID = tokenizer.encode_special(ASSISTANT_START_TOKEN)
+else:
+    PRED_TOKEN_ID = None
+    USER_START_ID = None
+    ASSISTANT_START_ID = None
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
@@ -126,6 +153,8 @@ val_dataset = TaskMixture([
 last_step = False # we will toggle this to True when we reach the end of the training dataset
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 current_epoch = 1 # track epoch for logging
+
+
 def mid_data_generator_bos_bestfit(split, buffer_size=100):
     """
     BOS-aligned dataloader for midtraining with bestfit-crop packing.
@@ -217,20 +246,24 @@ def mid_data_generator_bos_bestfit(split, buffer_size=100):
 
         yield inputs, targets
 
+
 train_loader = mid_data_generator_bos_bestfit("train")
 build_val_loader = lambda: mid_data_generator_bos_bestfit("val")
 progress = 0 # will go from 0 to 1 over the course of the epoch
+
 
 # Learning rate scheduler
 def get_lr_multiplier(progress):
     # first 80% of training: no decay, then linearly ramp down to 0.
     return 1 if progress < 0.8 else 1 - (progress - 0.8) / 0.2
 
+
 # Momentum scheduler for Muon optimizer
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
+
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -240,6 +273,7 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+jepa_loss_log = None
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -286,6 +320,7 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "window_pattern": model.config.window_pattern,
                 },
                 "user_config": user_config, # inputs to the training script
             }
@@ -296,14 +331,52 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
-    # evaluate the gradient
     synchronize()
     t0 = time.time()
+    step_jepa_loss = torch.tensor(0.0, device=device)
+    step_jepa_count = torch.tensor(0, device=device)
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            llm_loss = model(x, y)
+            total_loss = llm_loss
+
+            if use_jepa:
+                should_jepa = torch.zeros(1, device=device)
+                if master_process:
+                    should_jepa.fill_(1.0 if torch.rand(1).item() >= args.jepa_dropout else 0.0)
+                if ddp:
+                    dist.broadcast(should_jepa, src=0)
+
+                if should_jepa.item() > 0.5:
+                    jepa_loss_accum = torch.tensor(0.0, device=device)
+                    jepa_pair_count = 0
+
+                    for b in range(x.shape[0]):
+                        seq = x[b]
+                        user_ids, assistant_ids = extract_last_turn_views(
+                            seq, USER_START_ID, ASSISTANT_START_ID
+                        )
+                        if user_ids is None or assistant_ids is None:
+                            continue
+
+                        user_ids = user_ids[-args.jepa_view_max_len:]
+                        assistant_ids = assistant_ids[:args.jepa_view_max_len]
+
+                        j_loss = compute_jepa_loss(
+                            orig_model, user_ids, assistant_ids, PRED_TOKEN_ID, device
+                        )
+                        jepa_loss_accum = jepa_loss_accum + j_loss
+                        jepa_pair_count += 1
+
+                    if jepa_pair_count > 0:
+                        jepa_loss_mean = jepa_loss_accum / jepa_pair_count
+                        jepa_lambda_t = get_jepa_lambda(args.jepa_lambda, progress, 1.0, jepa_schedule)
+                        total_loss = total_loss + jepa_lambda_t * jepa_loss_mean
+                        step_jepa_loss = step_jepa_loss + jepa_loss_mean.detach()
+                        step_jepa_count = step_jepa_count + 1
+
+        train_loss = llm_loss.detach() # for logging
+        loss = total_loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
@@ -323,6 +396,14 @@ while True:
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
+    if use_jepa and ddp:
+        dist.all_reduce(step_jepa_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(step_jepa_count, op=dist.ReduceOp.SUM)
+
+    jepa_loss_log = None
+    if use_jepa and step_jepa_count.item() > 0:
+        jepa_loss_log = (step_jepa_loss / step_jepa_count).item()
+
     # State
     step += 1
 
@@ -336,9 +417,11 @@ while True:
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
+    jepa_lambda_now = get_jepa_lambda(args.jepa_lambda, progress, 1.0, jepa_schedule) if use_jepa else 0.0
+    jepa_str = f" | jepa: {jepa_loss_log:.4f} (λ={jepa_lambda_now:.3f})" if jepa_loss_log is not None else " | jepa: skip"
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{jepa_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
-        wandb_run.log({
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -348,7 +431,12 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": current_epoch,
-        })
+        }
+        if use_jepa:
+            log_data["jepa_lambda"] = jepa_lambda_now
+        if jepa_loss_log is not None:
+            log_data["jepa_loss"] = jepa_loss_log
+        wandb_run.log(log_data)
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -358,7 +446,7 @@ print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 # Log to report
 if not args.dry_run:
     from nanochat.report import get_report
-    get_report().log(section="Midtraining", data=[
+    get_report().log(section="Midtraining + JEPA", data=[
         user_config, # CLI args
         { # stats about the training setup
             "Number of iterations": step,
@@ -366,6 +454,7 @@ if not args.dry_run:
         },
         { # stats about training outcomes
             "Minimum validation bpb": min_val_bpb,
+            "JEPA loss": jepa_loss_log,
         }
     ])
 
