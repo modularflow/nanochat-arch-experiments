@@ -31,7 +31,7 @@ from nanochat.common import (
     print0,
 )
 from nanochat.engine import Engine
-from nanochat.jepa import get_jepa_lambda, JEPA_SCHEDULES
+from nanochat.jepa import get_jepa_lambda, compute_jepa_loss_batched, JEPA_SCHEDULES
 from nanochat.report import get_report
 from scripts.chat_eval import run_chat_eval
 from tasks.arc import ARC
@@ -273,8 +273,8 @@ else:
     USER_START_ID = None
     ASSISTANT_START_ID = None
 orig_model = model
-# model = torch.compile(model, dynamic=True)
-engine = Engine(model, tokenizer)
+model = torch.compile(model, dynamic=True)
+engine = Engine(orig_model, tokenizer)
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
@@ -402,7 +402,7 @@ for step in range(num_iterations):
         with torch.no_grad(), autocast_ctx:
             metrics["mmlu_acc"] = run_chat_eval(
                 "MMLU",
-                model,
+                orig_model,
                 tokenizer,
                 engine,
                 batch_size=args.device_batch_size * 2,
@@ -410,7 +410,7 @@ for step in range(num_iterations):
             )
             metrics["arc_easy_acc"] = run_chat_eval(
                 "ARC-Easy",
-                model,
+                orig_model,
                 tokenizer,
                 engine,
                 batch_size=args.device_batch_size * 2,
@@ -452,8 +452,8 @@ for step in range(num_iterations):
                 dist.broadcast(should_compute_jepa_tensor, src=0)
             should_compute_jepa = should_compute_jepa_tensor.item() > 0.5
             if should_compute_jepa:
-                jepa_loss_accum = torch.tensor(0.0, device=device)
-
+                views_a = []
+                views_b = []
                 for b in range(train_inputs.shape[0]):
                     active_positions = (train_targets[b] >= 0).nonzero(as_tuple=True)[0]
                     if len(active_positions) == 0:
@@ -471,20 +471,14 @@ for step in range(num_iterations):
                     if user_ids is None or assistant_ids is None:
                         continue
 
-                    user_ids = user_ids[-512:]
-                    assistant_ids = assistant_ids[:512]
-                    j_loss = compute_jepa_loss(
-                        model,
-                        user_ids,
-                        assistant_ids,
-                        PRED_TOKEN_ID,
-                        device,
-                    )
-                    jepa_loss_accum = jepa_loss_accum + j_loss
-                    jepa_pair_count += 1
+                    views_a.append(user_ids[-512:])
+                    views_b.append(assistant_ids[:512])
 
-                if jepa_pair_count > 0:
-                    jepa_loss_mean = jepa_loss_accum / jepa_pair_count
+                if views_a:
+                    jepa_pair_count = len(views_a)
+                    jepa_loss_mean = compute_jepa_loss_batched(
+                        orig_model, views_a, views_b, PRED_TOKEN_ID, device,
+                    )
                     jepa_lambda_t = get_jepa_lambda(jepa_base_lambda, step, num_iterations, jepa_schedule)
                     total_loss = total_loss + jepa_lambda_t * jepa_loss_mean
 
@@ -559,14 +553,14 @@ for step in range(num_iterations):
 # Save the model at the end of the run
 if master_process:
     base_dir = get_base_dir()
-    depth = model.config.n_layer
+    depth = orig_model.config.n_layer
     output_dirname = f"{args.model_tag}_jepa" if args.model_tag else f"d{depth}_jepa"
     checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-    model_config_kwargs = model.config.__dict__
+    model_config_kwargs = orig_model.config.__dict__
     save_checkpoint(
         checkpoint_dir,
         step,
-        model.state_dict(),
+        orig_model.state_dict(),
         None,
         {
             "step": step,

@@ -47,6 +47,25 @@ def _uses_crate_architecture(model_data):
     # CRATE checkpoints use mssa/(odl|ista) module names instead of attn/mlp.
     return any(".mssa." in key or ".odl." in key or ".ista." in key for key in model_data.keys())
 
+def _uses_trm_gpt_architecture(model_data):
+    return 'trm_marker' in model_data
+
+def _uses_rys_gpt_architecture(model_data):
+    return 'rys_layer_map' in model_data
+
+def _uses_noq_gpt_architecture(model_data):
+    # No-Q GPT has c_k and c_v but no c_q in attention blocks.
+    has_ck = any(".c_k." in key for key in model_data.keys())
+    has_cq = any(".c_q." in key for key in model_data.keys())
+    has_mssa = any(".mssa." in key or ".kv." in key for key in model_data.keys())
+    return has_ck and not has_cq and not has_mssa
+
+def _uses_noq_crate_architecture(model_data):
+    # No-Q CRATE uses .mssa.kv. (not .mssa.qkv.) alongside ODL/ISTA blocks.
+    has_mssa_kv = any(".mssa.kv." in key for key in model_data.keys())
+    has_mssa_qkv = any(".mssa.qkv." in key for key in model_data.keys())
+    return has_mssa_kv and not has_mssa_qkv
+
 def _detect_sparse_block_type(model_data):
     # Newer CRATE-alpha checkpoints store ODL parameters.
     if any(".odl." in key for key in model_data.keys()):
@@ -135,6 +154,13 @@ def build_model(checkpoint_dir, step, device, phase):
             if sf_key in selfflow_config:
                 model_config_kwargs.setdefault(sf_key, selfflow_config[sf_key])
         log0(f"Detected SelfFlowCRATE (sparse block: {sparse_block_type})")
+    elif _uses_noq_crate_architecture(model_data):
+        from nanochat.noq_crate import NoQCRATE, NoQCRATEConfig
+        model_class, model_config_class = NoQCRATE, NoQCRATEConfig
+        arch_name = "NoQCRATE"
+        sparse_block_type = _detect_sparse_block_type(model_data)
+        model_config_kwargs.setdefault("sparse_block_type", sparse_block_type)
+        log0(f"Detected NoQ-CRATE sparse block type: {sparse_block_type}")
     elif _uses_crate_architecture(model_data):
         from nanochat.crate import CRATE, CRATEConfig
         model_class, model_config_class = CRATE, CRATEConfig
@@ -142,6 +168,18 @@ def build_model(checkpoint_dir, step, device, phase):
         sparse_block_type = _detect_sparse_block_type(model_data)
         model_config_kwargs.setdefault("sparse_block_type", sparse_block_type)
         log0(f"Detected CRATE sparse block type: {sparse_block_type}")
+    elif _uses_trm_gpt_architecture(model_data):
+        from nanochat.trm_gpt import TRMGPT, TRMGPTConfig
+        model_class, model_config_class = TRMGPT, TRMGPTConfig
+        arch_name = "TRMGPT"
+    elif _uses_rys_gpt_architecture(model_data):
+        from nanochat.rys_gpt import RYSGPT, RYSGPTConfig
+        model_class, model_config_class = RYSGPT, RYSGPTConfig
+        arch_name = "RYSGPT"
+    elif _uses_noq_gpt_architecture(model_data):
+        from nanochat.noq_gpt import NoQGPT, NoQGPTConfig
+        model_class, model_config_class = NoQGPT, NoQGPTConfig
+        arch_name = "NoQGPT"
     else:
         model_class, model_config_class = GPT, GPTConfig
         arch_name = "GPT"

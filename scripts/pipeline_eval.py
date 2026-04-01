@@ -32,6 +32,11 @@ import torch
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # Tasks whose train data appears in mid-train or chat SFT
 CONTAMINATED_TASKS = {"arc_easy", "arc_challenge", "openbook_qa"}
 
@@ -190,6 +195,14 @@ def main():
         "--output-csv", type=str, default=None,
         help="Path to write comparison CSV (default: auto-generated)"
     )
+    parser.add_argument(
+        "--wandb-project", type=str, default=None,
+        help="W&B project name to log results (e.g. 'nanochat-eval'). Omit to skip W&B."
+    )
+    parser.add_argument(
+        "--wandb-run", type=str, default=None,
+        help="W&B run name (default: auto-generated from mode + tag)"
+    )
     args = parser.parse_args()
 
     # Distributed / precision setup
@@ -321,7 +334,69 @@ def main():
             report_data.append({f"{label} {aggregate_name}": res["core_metric"]})
         get_report().log(section=f"Pipeline evaluation ({args.mode})", data=report_data)
 
+    # Log to W&B
+    if ddp_rank == 0 and args.wandb_project and wandb is not None:
+        _log_wandb(args, specs, labels, all_results, aggregate_name)
+
     compute_cleanup()
+
+
+def _log_wandb(args, specs, labels, all_results, aggregate_name):
+    """Log comparison results to W&B as tables, bar charts, and summary metrics."""
+    run_name = args.wandb_run
+    if run_name is None:
+        tag = specs[0][1] or "default"
+        sources = "+".join(s for s, _, _ in specs)
+        run_name = f"{args.mode}_{sources}_{tag}"
+
+    run = wandb.init(
+        project=args.wandb_project,
+        name=run_name,
+        config={
+            "mode": args.mode,
+            "checkpoints": args.checkpoints,
+            "labels": labels,
+        },
+    )
+
+    task_labels = list(all_results[0]["centered_results"].keys())
+
+    # 1) W&B Table — full comparison grid
+    columns = ["Task"] + labels
+    table = wandb.Table(columns=columns)
+    for task in task_labels:
+        row = [task] + [res["centered_results"].get(task, None) for res in all_results]
+        table.add_data(*row)
+    table.add_data(aggregate_name, *[res["core_metric"] for res in all_results])
+    run.log({f"{aggregate_name} Table": table})
+
+    # 2) Per-task grouped bar chart — one row per (checkpoint, task) for W&B plotting
+    bar_data = []
+    for label, res in zip(labels, all_results):
+        for task in task_labels:
+            val = res["centered_results"].get(task, 0.0)
+            bar_data.append([label, task, val])
+        bar_data.append([label, aggregate_name, res["core_metric"]])
+
+    bar_table = wandb.Table(columns=["Checkpoint", "Task", "Centered Score"], data=bar_data)
+    run.log({
+        f"{aggregate_name} Bar Chart": wandb.plot.bar(
+            bar_table, "Task", "Centered Score",
+            title=f"{aggregate_name} by Task"
+        ),
+    })
+
+    # 3) Summary scalars for the dashboard — easy to sort/filter runs by aggregate
+    for label, res in zip(labels, all_results):
+        safe_label = label.replace(":", "/").replace(" ", "_")
+        run.summary[f"{safe_label}/{aggregate_name}"] = res["core_metric"]
+        for task in task_labels:
+            val = res["centered_results"].get(task)
+            if val is not None:
+                run.summary[f"{safe_label}/{task}"] = val
+
+    run.finish()
+    print0(f"Logged comparison to W&B project '{args.wandb_project}', run '{run_name}'.")
 
 
 if __name__ == "__main__":

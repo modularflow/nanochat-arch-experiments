@@ -27,7 +27,7 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.tokenizer import get_token_bytes
 from nanochat.jepa import (
     get_backbone, ensure_pred_token_slot,
-    compute_jepa_loss, extract_last_turn_views,
+    compute_jepa_loss, compute_jepa_loss_batched, extract_last_turn_views,
     get_jepa_lambda, JEPA_SCHEDULES,
 )
 from tasks.common import TaskMixture
@@ -305,6 +305,8 @@ while True:
     if master_process and last_step and not args.dry_run:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+        model_config_dict = dict(orig_model.config.__dict__)
+        model_config_dict["sequence_len"] = args.max_seq_len
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -313,15 +315,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": model.config.vocab_size,
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": model_config_dict,
                 "user_config": user_config, # inputs to the training script
             }
         )
@@ -348,9 +342,8 @@ while True:
                     dist.broadcast(should_jepa, src=0)
 
                 if should_jepa.item() > 0.5:
-                    jepa_loss_accum = torch.tensor(0.0, device=device)
-                    jepa_pair_count = 0
-
+                    views_a = []
+                    views_b = []
                     for b in range(x.shape[0]):
                         seq = x[b]
                         user_ids, assistant_ids = extract_last_turn_views(
@@ -358,18 +351,13 @@ while True:
                         )
                         if user_ids is None or assistant_ids is None:
                             continue
+                        views_a.append(user_ids[-args.jepa_view_max_len:])
+                        views_b.append(assistant_ids[:args.jepa_view_max_len])
 
-                        user_ids = user_ids[-args.jepa_view_max_len:]
-                        assistant_ids = assistant_ids[:args.jepa_view_max_len]
-
-                        j_loss = compute_jepa_loss(
-                            orig_model, user_ids, assistant_ids, PRED_TOKEN_ID, device
+                    if views_a:
+                        jepa_loss_mean = compute_jepa_loss_batched(
+                            orig_model, views_a, views_b, PRED_TOKEN_ID, device
                         )
-                        jepa_loss_accum = jepa_loss_accum + j_loss
-                        jepa_pair_count += 1
-
-                    if jepa_pair_count > 0:
-                        jepa_loss_mean = jepa_loss_accum / jepa_pair_count
                         jepa_lambda_t = get_jepa_lambda(args.jepa_lambda, progress, 1.0, jepa_schedule)
                         total_loss = total_loss + jepa_lambda_t * jepa_loss_mean
                         step_jepa_loss = step_jepa_loss + jepa_loss_mean.detach()

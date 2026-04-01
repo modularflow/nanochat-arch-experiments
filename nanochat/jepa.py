@@ -175,17 +175,71 @@ def extract_last_turn_views(seq, user_start_id, assistant_start_id, min_len=4):
     return user_ids, assistant_ids
 
 
+def compute_jepa_loss_batched(model, views_a, views_b, pred_token_id, device):
+    """
+    Batched JEPA loss: 2 forward passes total instead of 2*N.
+
+    Pads variable-length views, runs one batched forward for all view_a's (with
+    grad) and one for all view_b's (no grad), then gathers hidden states at the
+    correct (non-padded) positions.
+
+    With causal attention, right-padding does not affect hidden states of
+    earlier (real) tokens, so this is numerically identical to the per-sample
+    version.
+
+    Args:
+        views_a: list of 1-D tensors (view A token ids, without pred token)
+        views_b: list of 1-D tensors (view B token ids)
+
+    Returns:
+        mean loss scalar (with grad through view_a path)
+    """
+    N = len(views_a)
+    assert N == len(views_b) and N > 0
+
+    pred_id = torch.tensor([pred_token_id], dtype=torch.long, device=device)
+
+    # Prepare view_a: append <|pred|>, right-pad, stack
+    a_seqs = [torch.cat([v, pred_id]) for v in views_a]
+    a_lengths = torch.tensor([s.size(0) for s in a_seqs], device=device)
+    max_a = a_lengths.max().item()
+    a_padded = torch.zeros(N, max_a, dtype=torch.long, device=device)
+    for i, s in enumerate(a_seqs):
+        a_padded[i, :s.size(0)] = s
+
+    # Prepare view_b: right-pad, stack
+    b_lengths = torch.tensor([v.size(0) for v in views_b], device=device)
+    max_b = b_lengths.max().item()
+    b_padded = torch.zeros(N, max_b, dtype=torch.long, device=device)
+    for i, v in enumerate(views_b):
+        b_padded[i, :v.size(0)] = v
+
+    # Forward view_b (no grad) — one batched pass
+    with torch.no_grad():
+        hidden_b = forward_final_hidden(model, b_padded)
+    b_gather = (b_lengths - 1).view(N, 1, 1).expand(-1, 1, hidden_b.size(-1))
+    target_embeds = hidden_b.gather(1, b_gather).squeeze(1).detach()
+
+    # Forward view_a (with grad) — one batched pass
+    hidden_a = forward_final_hidden(model, a_padded)
+    a_gather = (a_lengths - 1).view(N, 1, 1).expand(-1, 1, hidden_a.size(-1))
+    pred_embeds = hidden_a.gather(1, a_gather).squeeze(1)
+
+    # Batched cosine similarity
+    loss = 1.0 - F.cosine_similarity(pred_embeds, target_embeds, dim=1)
+    return loss.mean()
+
+
 def compute_jepa_loss_for_batch(model, x, y, pred_token_id, device,
                                 view_min_len=64, max_view_tokens=256):
     """
     Compute the average JEPA loss over a batch of sequences.
 
-    Iterates over sequences in the batch, splits each into two views,
-    and computes the JEPA loss. Returns (mean_loss, num_pairs) or
-    (None, 0) if no valid pairs were found.
+    Collects all valid view pairs, then runs a single batched computation.
+    Returns (mean_loss, num_pairs) or (None, 0) if no valid pairs.
     """
-    jepa_loss_accum = torch.tensor(0.0, device=device)
-    pair_count = 0
+    views_a = []
+    views_b = []
 
     for b in range(x.shape[0]):
         valid = (y[b] >= 0).nonzero(as_tuple=True)[0]
@@ -199,13 +253,11 @@ def compute_jepa_loss_for_batch(model, x, y, pred_token_id, device,
         if view_a is None or view_b is None:
             continue
 
-        view_a = view_a[-max_view_tokens:]
-        view_b = view_b[:max_view_tokens]
+        views_a.append(view_a[-max_view_tokens:])
+        views_b.append(view_b[:max_view_tokens])
 
-        j_loss = compute_jepa_loss(model, view_a, view_b, pred_token_id, device)
-        jepa_loss_accum = jepa_loss_accum + j_loss
-        pair_count += 1
+    if not views_a:
+        return None, 0
 
-    if pair_count > 0:
-        return jepa_loss_accum / pair_count, pair_count
-    return None, 0
+    loss = compute_jepa_loss_batched(model, views_a, views_b, pred_token_id, device)
+    return loss, len(views_a)

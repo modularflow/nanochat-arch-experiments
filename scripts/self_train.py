@@ -31,7 +31,7 @@ from nanochat.checkpoint_manager import load_model, save_checkpoint
 from nanochat.engine import Engine
 from nanochat.jepa import (
     get_backbone, ensure_pred_token_slot,
-    compute_jepa_loss, extract_last_turn_views,
+    compute_jepa_loss, compute_jepa_loss_batched, extract_last_turn_views,
 )
 from nanochat.self_training import (
     PromptSource,
@@ -316,9 +316,8 @@ def run_train_phase(pseudo_label_dataset, iteration_idx):
 
                 if should_jepa.item() > 0.5:
                     with autocast_ctx:
-                        jepa_loss_accum = torch.tensor(0.0, device=device)
-                        jepa_pair_count = 0
-
+                        views_a = []
+                        views_b = []
                         for b in range(train_inputs.shape[0]):
                             seq = train_inputs[b]
                             user_ids, assistant_ids = extract_last_turn_views(
@@ -326,18 +325,13 @@ def run_train_phase(pseudo_label_dataset, iteration_idx):
                             )
                             if user_ids is None or assistant_ids is None:
                                 continue
+                            views_a.append(user_ids[-args.jepa_view_max_len:])
+                            views_b.append(assistant_ids[:args.jepa_view_max_len])
 
-                            user_ids = user_ids[-args.jepa_view_max_len:]
-                            assistant_ids = assistant_ids[:args.jepa_view_max_len]
-
-                            j_loss = compute_jepa_loss(
-                                orig_model, user_ids, assistant_ids, PRED_TOKEN_ID, device
+                        if views_a:
+                            jepa_loss_mean = compute_jepa_loss_batched(
+                                orig_model, views_a, views_b, PRED_TOKEN_ID, device
                             )
-                            jepa_loss_accum = jepa_loss_accum + j_loss
-                            jepa_pair_count += 1
-
-                        if jepa_pair_count > 0:
-                            jepa_loss_mean = jepa_loss_accum / jepa_pair_count
                             total_loss = llm_loss + args.jepa_lambda * jepa_loss_mean
                             step_jepa_loss = step_jepa_loss + jepa_loss_mean.detach()
                             step_jepa_count = step_jepa_count + 1

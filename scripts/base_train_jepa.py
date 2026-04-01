@@ -23,6 +23,10 @@ import torch.distributed as dist
 
 from nanochat.crate import CRATE, CRATEConfig
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.noq_gpt import NoQGPT, NoQGPTConfig
+from nanochat.noq_crate import NoQCRATE, NoQCRATEConfig
+from nanochat.rys_gpt import RYSGPT, RYSGPTConfig
+from nanochat.trm_gpt import TRMGPT, TRMGPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -31,7 +35,8 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.jepa import (
     get_backbone, ensure_pred_token_slot, forward_final_hidden,
-    compute_jepa_loss, split_views, get_jepa_lambda, JEPA_SCHEDULES,
+    compute_jepa_loss, compute_jepa_loss_for_batch, split_views,
+    get_jepa_lambda, JEPA_SCHEDULES,
 )
 from scripts.base_eval import evaluate_model
 print_banner()
@@ -45,8 +50,14 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
-parser.add_argument("--architecture", type=str, default="crate", choices=["crate", "gpt"],
-    help="Model architecture to train: CRATE or vanilla GPT")
+parser.add_argument("--architecture", type=str, default="crate", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt"],
+    help="Model architecture: crate, gpt, noq_gpt, noq_crate, rys_gpt, trm_gpt")
+parser.add_argument("--rys-block-start", type=int, default=3, help="RYS: first unique block in repeated section (inclusive)")
+parser.add_argument("--rys-block-end", type=int, default=6, help="RYS: end of repeated section (exclusive)")
+parser.add_argument("--rys-num-repeats", type=int, default=2, help="RYS: times the middle block is traversed")
+parser.add_argument("--rys-blocks", type=str, default="", help="RYS multi-block: 'start1,end1;start2,end2;...' (overrides single-block params)")
+parser.add_argument("--trm-n-recur", type=int, default=6, help="TRM: recursions per cycle (each traverses all unique blocks)")
+parser.add_argument("--trm-T-cycles", type=int, default=3, help="TRM: total recursion cycles (T-1 without grad during training)")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -132,6 +143,9 @@ print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
 print0(f"architecture: {args.architecture}")
+if args.architecture == "trm_gpt":
+    trm_effective = num_layers * args.trm_n_recur * args.trm_T_cycles
+    print0(f"TRM: n_unique={num_layers}, n_recur={args.trm_n_recur}, T_cycles={args.trm_T_cycles}, effective_depth={trm_effective}")
 
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
@@ -155,18 +169,44 @@ if batch_ratio != 1.0:
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {args.total_batch_size:,} (reference: {reference_batch_size:,})")
 
 # Weight decay is tuned at d12 and its scaling seems to be \propto 1/channels^2 (or equivalently, \propto 1/depth^2 due to constant aspect ratio)
-weight_decay_scaled = args.weight_decay * (12 / args.depth)**2
-if args.depth != 12:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+if args.architecture == "trm_gpt":
+    # For TRM, depth=n_unique_layers is tiny; scale by effective depth instead
+    wd_depth = num_layers * args.trm_n_recur * args.trm_T_cycles
+else:
+    wd_depth = args.depth
+weight_decay_scaled = args.weight_decay * (12 / wd_depth)**2
+if wd_depth != 12:
+    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for {'effective ' if args.architecture == 'trm_gpt' else ''}depth {wd_depth}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern)
+if args.architecture == "trm_gpt":
+    # For TRM, --depth means n_unique_layers (e.g. 2), effective depth is computed from recursion params
+    model_config_kwargs = dict(
+        sequence_len=args.max_seq_len, vocab_size=vocab_size,
+        n_unique_layers=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
+        window_pattern=args.window_pattern,
+        n_recur=args.trm_n_recur, T_cycles=args.trm_T_cycles,
+    )
+else:
+    model_config_kwargs = dict(
+        sequence_len=args.max_seq_len, vocab_size=vocab_size,
+        n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
+        window_pattern=args.window_pattern,
+    )
+if args.architecture == "rys_gpt":
+    model_config_kwargs.update(rys_block_start=args.rys_block_start, rys_block_end=args.rys_block_end, rys_num_repeats=args.rys_num_repeats)
+    if args.rys_blocks:
+        model_config_kwargs["rys_blocks"] = args.rys_blocks
 model_class, model_config_class = {
     "crate": (CRATE, CRATEConfig),
     "gpt": (GPT, GPTConfig),
+    "noq_gpt": (NoQGPT, NoQGPTConfig),
+    "noq_crate": (NoQCRATE, NoQCRATEConfig),
+    "rys_gpt": (RYSGPT, RYSGPTConfig),
+    "trm_gpt": (TRMGPT, TRMGPTConfig),
 }[args.architecture]
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
@@ -416,32 +456,12 @@ while True:
 
             if should_jepa.item() > 0.5:
                 with autocast_ctx:
-                    jepa_loss_accum = torch.tensor(0.0, device=device)
-                    jepa_pair_count = 0
+                    jepa_loss_mean, jepa_pair_count = compute_jepa_loss_for_batch(
+                        orig_model, x, y, PRED_TOKEN_ID, device,
+                        view_min_len=args.jepa_view_min_len, max_view_tokens=256,
+                    )
 
-                    for b in range(x.shape[0]):
-                        valid = (y[b] >= 0).nonzero(as_tuple=True)[0]
-                        if len(valid) == 0:
-                            continue
-                        effective_len = valid[-1].item() + 2
-                        effective_len = min(effective_len, x[b].size(0))
-                        seq = x[b, :effective_len]
-
-                        view_a, view_b = split_views(seq, min_len=args.jepa_view_min_len)
-                        if view_a is None or view_b is None:
-                            continue
-
-                        view_a = view_a[-256:]
-                        view_b = view_b[:256]
-
-                        j_loss = compute_jepa_loss(
-                            orig_model, view_a, view_b, PRED_TOKEN_ID, device
-                        )
-                        jepa_loss_accum = jepa_loss_accum + j_loss
-                        jepa_pair_count += 1
-
-                    if jepa_pair_count > 0:
-                        jepa_loss_mean = jepa_loss_accum / jepa_pair_count
+                    if jepa_loss_mean is not None:
                         jepa_lambda_t = get_jepa_lambda(jepa_base_lambda, step, num_iterations, jepa_schedule)
                         total_loss = llm_loss + jepa_lambda_t * jepa_loss_mean
                         step_jepa_loss = step_jepa_loss + jepa_loss_mean.detach()
