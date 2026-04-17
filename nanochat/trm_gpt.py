@@ -220,6 +220,46 @@ class TRMGPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
+    def _run_cycles(self, x, x0, cos_sin, kv_cache):
+        """Run all T recursion cycles with the TRM memory optimisation.
+
+        During training, T-1 cycles run under ``torch.no_grad`` and hidden
+        states are detached between cycles.  The autocast weight cache is
+        cleared before the final (gradient-tracked) cycle so that shared block
+        weights are re-cast with autograd tracking intact (PyTorch's autocast
+        caches the bf16 cast; if the first use is under no_grad the cached
+        version has no grad_fn, poisoning later uses).
+        """
+        layers_per_cycle = self._layers_per_cycle
+        for t in range(self.config.T_cycles):
+            eff_offset = t * layers_per_cycle
+            use_no_grad = self.training and t < self.config.T_cycles - 1
+            if use_no_grad:
+                with torch.no_grad():
+                    x = self._run_cycle(x, x0, cos_sin, eff_offset, kv_cache)
+                x = x.detach()
+            else:
+                if self.training and t > 0:
+                    torch.clear_autocast_cache()
+                x = self._run_cycle(x, x0, cos_sin, eff_offset, kv_cache)
+        return x
+
+    def forward_to_final_hidden(self, idx):
+        """Full multi-cycle recursive forward returning the final hidden state (before lm_head).
+
+        Used by JEPA to get a representation that respects TRM's recursion
+        cycles, rather than iterating only over the unique physical blocks.
+        Mirrors training behaviour: T-1 cycles without grad, last cycle with grad.
+        """
+        B, T = idx.size()
+        assert T <= self.cos.size(1)
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        x = self._run_cycles(x, x0, cos_sin, None)
+        return norm(x)
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1)
@@ -230,17 +270,7 @@ class TRMGPT(nn.Module):
         x = norm(x)
         x0 = x
 
-        layers_per_cycle = self._layers_per_cycle
-        for t in range(self.config.T_cycles):
-            eff_offset = t * layers_per_cycle
-            # During training: T-1 cycles without grad, detach between cycles
-            use_no_grad = self.training and t < self.config.T_cycles - 1
-            if use_no_grad:
-                with torch.no_grad():
-                    x = self._run_cycle(x, x0, cos_sin, eff_offset, kv_cache)
-                x = x.detach()
-            else:
-                x = self._run_cycle(x, x0, cos_sin, eff_offset, kv_cache)
+        x = self._run_cycles(x, x0, cos_sin, kv_cache)
 
         x = norm(x)
 

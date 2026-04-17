@@ -15,12 +15,7 @@ ${PYTHON_BIN} -m scripts.pipeline_eval \
         base:d12-trm-jepa-lindecay-4090 \
         base:d12-rys-4090-2 \
         base:d12-rys-jepa-lindecay-4090 \
-        base:d12-gpt-4090 \
-        base:d12-gpt-jepa-4090 \
-        base:d12-gpt-jepa-lindecay-4090 \
-        base:d12-jepa-4090 \
-        base:d12-noqgpt-4090 \
-        base:d12-noqgpt-jepa-4090
+
 
 echo ""
 echo "================================================================"
@@ -34,10 +29,7 @@ ${PYTHON_BIN} -m scripts.pipeline_eval \
         sft:d12-trm-jepa-lindecay-4090_jepa \
         sft:d12-rys-4090-2_jepa \
         sft:d12-rys-jepa-lindecay-4090_jepa \
-        sft:d12-gpt-4090 \
-        sft:d12-gpt-jepa-4090_jepa \
-        sft:d12-gpt-jepa-lindecay-4090_jepa \
-        sft:d12-jepa-4090_jepa
+
 
 echo ""
 echo "================================================================"

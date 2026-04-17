@@ -125,13 +125,16 @@ def ensure_pred_token(model, tokenizer, device):
 
 def forward_final_hidden(model, idx):
     """
-    Run the shared backbone path manually and return the final hidden states.
+    Run the shared backbone path and return the final hidden states (before lm_head).
 
-    This works across GPT, CRATE, and SelfFlowCRATE because they all expose the
-    same backbone tensors/blocks through `transformer`, `resid_lambdas`,
-    `x0_lambdas`, `window_sizes`, `cos`, and `sin`.
+    Dispatches to ``backbone.forward_to_final_hidden(idx)`` when available
+    (e.g. RYS-GPT, TRM-GPT) so the full effective-depth forward is used.
+    Falls back to a generic loop over ``backbone.transformer.h`` for models
+    whose unique blocks == effective layers (GPT, NoQGPT, CRATE).
     """
     backbone = get_backbone(model)
+    if hasattr(backbone, "forward_to_final_hidden"):
+        return backbone.forward_to_final_hidden(idx)
     _, seq_len = idx.size()
     assert seq_len <= backbone.cos.size(1), (
         f"Sequence length grew beyond rotary embeddings cache: {seq_len} > {backbone.cos.size(1)}"

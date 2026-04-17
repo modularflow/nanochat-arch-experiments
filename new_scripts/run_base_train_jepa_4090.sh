@@ -24,7 +24,7 @@ fi
 
 WANDB_RUN="${WANDB_RUN:-dummy}"
 MODEL_TAG="${MODEL_TAG:-d12-jepa-4090}"
-ARCHITECTURE="${ARCHITECTURE:-crate}"
+ARCHITECTURE="${ARCHITECTURE:-gpt}"
 
 # Tuned 24GB-friendly defaults. With TOTAL_BATCH_SIZE=65536 on one GPU,
 # clean device_batch_size values are divisors of 64 such as 8, 16, or 32.

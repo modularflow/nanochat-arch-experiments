@@ -15,6 +15,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import time
+import warnings
 from contextlib import nullcontext
 
 import wandb
@@ -36,7 +37,7 @@ from nanochat.engine import Engine
 from nanochat.jepa import (
     get_backbone, ensure_pred_token_slot, forward_final_hidden,
     compute_jepa_loss, compute_jepa_loss_for_batch, split_views,
-    get_jepa_lambda, JEPA_SCHEDULES,
+    get_jepa_lambda, JEPA_SCHEDULES, resize_model_vocab,
 )
 from scripts.base_eval import evaluate_model
 print_banner()
@@ -50,8 +51,9 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
-parser.add_argument("--architecture", type=str, default="crate", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt"],
-    help="Model architecture: crate, gpt, noq_gpt, noq_crate, rys_gpt, trm_gpt")
+parser.add_argument("--architecture", type=str, default="gpt", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt"],
+    help="Backbone: gpt (default), or crate (deprecated — worse empirical results; kept for legacy checkpoints), "
+         "noq_gpt, noq_crate, rys_gpt, trm_gpt")
 parser.add_argument("--rys-block-start", type=int, default=3, help="RYS: first unique block in repeated section (inclusive)")
 parser.add_argument("--rys-block-end", type=int, default=6, help="RYS: end of repeated section (exclusive)")
 parser.add_argument("--rys-num-repeats", type=int, default=2, help="RYS: times the middle block is traversed")
@@ -61,6 +63,11 @@ parser.add_argument("--trm-T-cycles", type=int, default=3, help="TRM: total recu
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument(
+    "--num-kv-heads", type=int, default=None,
+    help="KV heads for Grouped-Query Attention (default: same as query heads). "
+         "Must divide num_heads. GQA requires --architecture gpt|noq_gpt|rys_gpt|trm_gpt (not CRATE/NoQCRATE).",
+)
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -99,6 +106,14 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.architecture == "crate":
+    warnings.warn(
+        "The 'crate' (CRATE-α) architecture is deprecated for new runs — it has consistently "
+        "underperformed vanilla GPT in this fork. Prefer --architecture gpt. "
+        "CRATE remains supported for loading old checkpoints and reproduction.",
+        FutureWarning,
+        stacklevel=1,
+    )
 user_config = vars(args).copy()  # for logging
 jepa_base_lambda = args.jepa_lambda
 jepa_schedule = args.jepa_schedule
@@ -137,7 +152,20 @@ def find_num_heads(model_dim, target_head_dim):
                 return candidate
     return 1
 num_heads = find_num_heads(model_dim, args.head_dim)
-num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
+if args.num_kv_heads is None:
+    num_kv_heads = num_heads  # 1:1 — GQA disabled
+else:
+    num_kv_heads = args.num_kv_heads
+    if num_kv_heads < 1 or num_kv_heads > num_heads or num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_kv_heads ({num_kv_heads}) must satisfy 1 <= num_kv_heads <= num_heads ({num_heads}) "
+            f"and num_heads % num_kv_heads == 0"
+        )
+    if num_kv_heads < num_heads and args.architecture in ("crate", "noq_crate"):
+        raise ValueError(
+            "Grouped-Query Attention (--num-kv-heads < num_heads) is not supported for CRATE/NoQCRATE "
+            "(tied QKV). Use --architecture gpt, noq_gpt, rys_gpt, or trm_gpt."
+        )
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")

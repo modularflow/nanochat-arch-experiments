@@ -40,8 +40,13 @@ def _patch_missing_keys(model_data, model_config):
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def _uses_selfflow_architecture(model_data):
-    # SelfFlowCRATE checkpoints have proj_heads and/or corruption_conditioner keys.
+    # SelfFlowCRATE / SelfFlowGPT checkpoints have proj_heads and/or corruption_conditioner keys.
     return any(k.startswith("proj_heads.") or k.startswith("corruption_conditioner.") for k in model_data.keys())
+
+
+def _selfflow_backbone_is_gpt(model_data):
+    """Detect SelfFlowGPT vs SelfFlowCRATE from weight keys (when metadata missing)."""
+    return any(k.startswith("backbone.transformer.h.0.attn.c_q") for k in model_data.keys())
 
 def _uses_crate_architecture(model_data):
     # CRATE checkpoints use mssa/(odl|ista) module names instead of attn/mlp.
@@ -141,19 +146,32 @@ def build_model(checkpoint_dir, step, device, phase):
             model_config_kwargs["vocab_size"] = actual_vocab
     log0(f"Building model with config: {model_config_kwargs}")
     if _uses_selfflow_architecture(model_data):
-        from nanochat.self_flow_model import SelfFlowCRATE, SelfFlowConfig
-        model_class, model_config_class = SelfFlowCRATE, SelfFlowConfig
-        arch_name = "SelfFlowCRATE"
-        sparse_block_type = _detect_sparse_block_type(model_data)
-        model_config_kwargs.setdefault("sparse_block_type", sparse_block_type)
-        # Pull self-flow config from metadata if available
         selfflow_config = meta_data.get("selfflow_config", {})
-        for sf_key in ("student_layers", "teacher_layers", "proj_hidden_mult",
-                       "corruption_conditioning", "cond_hidden_mult",
-                       "corruption_strategy", "rep_loss_type", "rep_loss_weight"):
-            if sf_key in selfflow_config:
-                model_config_kwargs.setdefault(sf_key, selfflow_config[sf_key])
-        log0(f"Detected SelfFlowCRATE (sparse block: {sparse_block_type})")
+        backbone_kind = selfflow_config.get("selfflow_backbone")
+        if backbone_kind is None:
+            backbone_kind = "gpt" if _selfflow_backbone_is_gpt(model_data) else "crate"
+        if backbone_kind == "gpt":
+            from nanochat.self_flow_model import SelfFlowGPT, SelfFlowGPTConfig
+            model_class, model_config_class = SelfFlowGPT, SelfFlowGPTConfig
+            arch_name = "SelfFlowGPT"
+            for sf_key in ("student_layers", "teacher_layers", "proj_hidden_mult",
+                           "corruption_conditioning", "cond_hidden_mult",
+                           "corruption_strategy", "rep_loss_type", "rep_loss_weight"):
+                if sf_key in selfflow_config:
+                    model_config_kwargs.setdefault(sf_key, selfflow_config[sf_key])
+            log0("Detected SelfFlowGPT")
+        else:
+            from nanochat.self_flow_model import SelfFlowCRATE, SelfFlowConfig
+            model_class, model_config_class = SelfFlowCRATE, SelfFlowConfig
+            arch_name = "SelfFlowCRATE"
+            sparse_block_type = _detect_sparse_block_type(model_data)
+            model_config_kwargs.setdefault("sparse_block_type", sparse_block_type)
+            for sf_key in ("student_layers", "teacher_layers", "proj_hidden_mult",
+                           "corruption_conditioning", "cond_hidden_mult",
+                           "corruption_strategy", "rep_loss_type", "rep_loss_weight"):
+                if sf_key in selfflow_config:
+                    model_config_kwargs.setdefault(sf_key, selfflow_config[sf_key])
+            log0(f"Detected SelfFlowCRATE (sparse block: {sparse_block_type})")
     elif _uses_noq_crate_architecture(model_data):
         from nanochat.noq_crate import NoQCRATE, NoQCRATEConfig
         model_class, model_config_class = NoQCRATE, NoQCRATEConfig

@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.crate import CRATE, CRATEConfig, norm
+from nanochat.gpt import GPT, GPTConfig, norm as gpt_norm
 from nanochat.corruption import CorruptionStrategy, build_corruption_strategy
 
 try:
@@ -59,6 +60,20 @@ class SelfFlowConfig(CRATEConfig):
     # Loss
     rep_loss_type: str = "cosine"  # "cosine" | "mse" | "smooth_l1"
     rep_loss_weight: float = 1.0   # gamma in L = L_gen + gamma * L_rep
+
+
+@dataclass
+class SelfFlowGPTConfig(GPTConfig):
+    """Vanilla GPT backbone + Self-Flow parameters (same auxiliary fields as SelfFlowConfig)."""
+
+    student_layers: str = ""
+    teacher_layers: str = ""
+    proj_hidden_mult: int = 2
+    corruption_conditioning: bool = True
+    cond_hidden_mult: int = 4
+    corruption_strategy: str = "embedding_interpolation"
+    rep_loss_type: str = "cosine"
+    rep_loss_weight: float = 1.0
 
 
 # =============================================================================
@@ -411,6 +426,214 @@ class SelfFlowCRATE(nn.Module):
             (total_loss, metrics_dict) where metrics_dict contains per-layer
             rep losses and the combined loss for logging.
         """
+        rep_losses = []
+        metrics = {"lm_loss": lm_loss.item()}
+
+        for i, (s_layer, t_layer) in enumerate(zip(self.student_layer_indices, self.teacher_layer_indices)):
+            s_hidden = student_hiddens[s_layer]
+            t_hidden = teacher_hiddens[t_layer]
+            rep_loss = compute_rep_loss(
+                s_hidden, t_hidden, self.proj_heads[i],
+                loss_type=self.config.rep_loss_type,
+            )
+            rep_losses.append(rep_loss)
+            metrics[f"rep_loss_s{s_layer}_t{t_layer}"] = rep_loss.item()
+
+        total_rep_loss = sum(rep_losses) / len(rep_losses) if rep_losses else torch.tensor(0.0)
+        total_loss = lm_loss + self.config.rep_loss_weight * total_rep_loss
+
+        metrics["rep_loss"] = total_rep_loss.item() if isinstance(total_rep_loss, torch.Tensor) else total_rep_loss
+        metrics["total_loss"] = total_loss.item()
+
+        return total_loss, metrics
+
+
+# =============================================================================
+# SelfFlowGPT Model (vanilla GPT backbone)
+# =============================================================================
+
+class SelfFlowGPT(nn.Module):
+    """
+    Same Self-Flow training interface as SelfFlowCRATE, but wraps ``nanochat.gpt.GPT``.
+    """
+
+    def __init__(self, config: SelfFlowGPTConfig, pad_vocab_size_to: int = 64):
+        super().__init__()
+        self.config = config
+
+        self.backbone = GPT(config, pad_vocab_size_to=pad_vocab_size_to)
+
+        self.student_layer_indices = self._parse_layers(config.student_layers, config.n_layer, "student")
+        self.teacher_layer_indices = self._parse_layers(config.teacher_layers, config.n_layer, "teacher")
+        assert len(self.student_layer_indices) == len(self.teacher_layer_indices), \
+            f"Number of student layers ({len(self.student_layer_indices)}) must match teacher layers ({len(self.teacher_layer_indices)})"
+
+        self.proj_heads = nn.ModuleList([
+            ProjectionHead(config.n_embd, config.proj_hidden_mult)
+            for _ in self.student_layer_indices
+        ])
+
+        self.use_conditioning = config.corruption_conditioning
+        if self.use_conditioning:
+            self.corruption_conditioner = CorruptionConditioner(
+                config.n_embd, hidden_mult=config.cond_hidden_mult
+            )
+
+        print0(f"SelfFlowGPT: student_layers={self.student_layer_indices}, "
+               f"teacher_layers={self.teacher_layer_indices}, "
+               f"conditioning={self.use_conditioning}, "
+               f"rep_loss={config.rep_loss_type}")
+
+    @staticmethod
+    def _parse_layers(layers_str: str, n_layer: int, role: str) -> List[int]:
+        if layers_str.strip():
+            indices = [int(x.strip()) for x in layers_str.split(",")]
+        else:
+            if role == "student":
+                indices = [n_layer // 3]
+            else:
+                indices = [2 * n_layer // 3]
+        for idx in indices:
+            assert 0 <= idx < n_layer, f"{role} layer {idx} out of range [0, {n_layer})"
+        return indices
+
+    @property
+    def transformer(self):
+        return self.backbone.transformer
+
+    @property
+    def lm_head(self):
+        return self.backbone.lm_head
+
+    def get_device(self):
+        return self.backbone.get_device()
+
+    def estimate_flops(self):
+        return self.backbone.estimate_flops()
+
+    def num_scaling_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def init_weights(self):
+        self.backbone.init_weights()
+        for proj in self.proj_heads:
+            for m in proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        if self.use_conditioning:
+            for m in self.corruption_conditioner.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+    def generate(self, *args, **kwargs):
+        return self.backbone.generate(*args, **kwargs)
+
+    def setup_optimizers(self, proj_lr: float = 0.001, **backbone_kwargs):
+        backbone_opts = self.backbone.setup_optimizers(**backbone_kwargs)
+
+        selfflow_params = list(self.proj_heads.parameters())
+        if self.use_conditioning:
+            selfflow_params += list(self.corruption_conditioner.parameters())
+
+        from functools import partial
+        ddp, rank, local_rank, world_size = get_dist_info()
+        if ddp:
+            from nanochat.adamw import DistAdamW
+            AdamWFactory = DistAdamW
+        else:
+            AdamWFactory = partial(torch.optim.AdamW, fused=torch.cuda.is_available())
+
+        selfflow_opt = AdamWFactory(
+            [{"params": selfflow_params, "lr": proj_lr}],
+            betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0,
+        )
+        for group in selfflow_opt.param_groups:
+            group["initial_lr"] = group["lr"]
+
+        return backbone_opts, selfflow_opt
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets=None,
+        kv_cache=None,
+        loss_reduction: str = "mean",
+        return_hidden_at=None,
+        corruption_levels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        embedding_bias = None
+        if corruption_levels is not None and self.use_conditioning:
+            embedding_bias = self.corruption_conditioner(corruption_levels)
+
+        return self.backbone(
+            idx, targets=targets, kv_cache=kv_cache,
+            loss_reduction=loss_reduction, return_hidden_at=return_hidden_at,
+            embedding_bias=embedding_bias,
+        )
+
+    def forward_selfflow(
+        self,
+        student_ids: torch.Tensor,
+        student_corruption_levels: torch.Tensor,
+        targets: torch.Tensor,
+        corruption_strategy: CorruptionStrategy,
+        forget_module=None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        clean_emb = self.backbone.transformer.wte(student_ids)
+        corrupted_emb = corruption_strategy.corrupt(
+            clean_emb, student_ids, student_corruption_levels,
+            self.backbone.transformer.wte,
+        )
+        corrupted_emb = gpt_norm(corrupted_emb)
+
+        if self.use_conditioning:
+            cond_bias = self.corruption_conditioner(student_corruption_levels)
+            corrupted_emb = corrupted_emb + cond_bias
+
+        B, T = student_ids.size()
+        cfg = self.backbone.config
+        assert T <= self.backbone.cos.size(1)
+        cos_sin = (self.backbone.cos[:, :T], self.backbone.sin[:, :T])
+
+        x = corrupted_emb
+        x0 = x
+        target_layers = set(self.student_layer_indices)
+        hidden_snapshots: Dict[int, torch.Tensor] = {}
+
+        for i, block in enumerate(self.backbone.transformer.h):
+            x = self.backbone.resid_lambdas[i] * x + self.backbone.x0_lambdas[i] * x0
+            x = block(x, cos_sin, self.backbone.window_sizes[i], None)
+            if forget_module is not None:
+                x = forget_module.apply(x, i)
+            if i in target_layers:
+                hidden_snapshots[i] = x
+
+        x = gpt_norm(x)
+
+        softcap = 15
+        logits = self.backbone.lm_head(x)
+        logits = logits[..., :cfg.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+
+        lm_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+        )
+
+        return lm_loss, hidden_snapshots
+
+    def compute_selfflow_loss(
+        self,
+        student_hiddens: Dict[int, torch.Tensor],
+        teacher_hiddens: Dict[int, torch.Tensor],
+        lm_loss: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         rep_losses = []
         metrics = {"lm_loss": lm_loss.item()}
 

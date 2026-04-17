@@ -48,7 +48,7 @@ CHAT_BASELINES = {"MMLU": 0.25, "HumanEval": 0.0}
 VALID_SOURCES = {
     "base", "mid", "sft", "rl",
     "semisup", "semisup_code", "semisup_general", "semisup_math",
-    "selfflow",
+    "selfflow", "selfflow_pretrain",
 }
 
 # -----------------------------------------------------------------------------

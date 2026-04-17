@@ -1,12 +1,15 @@
 """
 Self-Flow pretraining from scratch (or from checkpoint).
 
-Ground-up Self-Flow: trains a SelfFlowCRATE model with dual-timestep scheduling,
+Trains SelfFlowGPT (default) or SelfFlowCRATE with dual-timestep scheduling,
 pluggable corruption, per-token conditioning, and multi-scale representation
-alignment -- all as first-class training objectives alongside LM loss.
+alignment alongside LM loss. Optional JEPA auxiliary (--jepa-lambda) matches
+base_train_jepa.
 
 Usage:
     python -m scripts.self_flow_pretrain --depth 12 --num-iterations 5000
+    python -m scripts.self_flow_pretrain --backbone crate --depth 12
+    python -m scripts.self_flow_pretrain --jepa-lambda 0.25 --jepa-schedule linear_decay
 
     torchrun --nproc_per_node=8 -m scripts.self_flow_pretrain --depth 20
 
@@ -29,7 +32,16 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanochat.self_flow_model import SelfFlowCRATE, SelfFlowConfig
+from nanochat.crate import norm as crate_norm
+from nanochat.gpt import norm as gpt_norm
+
+from nanochat.self_flow_model import SelfFlowCRATE, SelfFlowConfig, SelfFlowGPT, SelfFlowGPTConfig
+from nanochat.jepa import (
+    ensure_pred_token_slot,
+    compute_jepa_loss_for_batch,
+    get_jepa_lambda,
+    JEPA_SCHEDULES,
+)
 from nanochat.dual_timestep import DualTimestepScheduler
 from nanochat.corruption import build_corruption_strategy
 from nanochat.adversarial import (
@@ -57,13 +69,17 @@ print_banner()
 # ---------------------------------------------------------------------------
 # CLI arguments
 # ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Self-Flow pretraining for CRATE")
+parser = argparse.ArgumentParser(description="Self-Flow pretraining (GPT or CRATE backbone)")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps")
 
 # Model architecture
+parser.add_argument(
+    "--backbone", type=str, default="gpt", choices=["gpt", "crate"],
+    help="Backbone: gpt (default, vanilla nanochat GPT) or crate (SelfFlowCRATE / white-box stack)",
+)
 parser.add_argument("--depth", type=int, default=12, help="transformer depth")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension")
@@ -81,6 +97,14 @@ parser.add_argument("--corruption-strategy", type=str, default="embedding_interp
                     help="corruption strategy")
 parser.add_argument("--rep-loss-type", type=str, default="cosine", choices=["cosine", "mse", "smooth_l1"])
 parser.add_argument("--rep-loss-weight", type=float, default=1.0, help="gamma: weight for representation loss")
+
+# Optional JEPA auxiliary (same objective as base_train_jepa; added on top of LM + rep loss)
+parser.add_argument("--jepa-lambda", type=float, default=0.0, help="JEPA loss weight (0 = disabled)")
+parser.add_argument("--jepa-schedule", type=str, default="constant", choices=JEPA_SCHEDULES,
+                    help="JEPA λ schedule when --jepa-lambda > 0")
+parser.add_argument("--jepa-dropout", type=float, default=0.5,
+                    help="Fraction of micro-batches to skip JEPA (parity with base_train_jepa)")
+parser.add_argument("--jepa-view-min-len", type=int, default=64, help="Minimum tokens per JEPA view")
 
 # Dual-Timestep Scheduler
 parser.add_argument("--noise-distribution", type=str, default="uniform",
@@ -142,6 +166,14 @@ parser.add_argument("--model-tag", type=str, default=None)
 args = parser.parse_args()
 user_config = vars(args).copy()
 
+jepa_base_lambda = args.jepa_lambda
+jepa_schedule = args.jepa_schedule
+jepa_dropout = args.jepa_dropout
+use_jepa = jepa_base_lambda > 0.0
+assert 0.0 <= jepa_dropout <= 1.0
+
+flow_norm = gpt_norm if args.backbone == "gpt" else crate_norm
+
 # ---------------------------------------------------------------------------
 # Compute init
 # ---------------------------------------------------------------------------
@@ -198,7 +230,7 @@ if batch_ratio != 1.0:
 weight_decay_scaled = args.weight_decay * (12 / args.depth) ** 2
 
 # ---------------------------------------------------------------------------
-# Build SelfFlowCRATE model
+# Build SelfFlow model (GPT or CRATE backbone)
 # ---------------------------------------------------------------------------
 model_config_kwargs = dict(
     sequence_len=args.max_seq_len,
@@ -219,8 +251,12 @@ model_config_kwargs = dict(
 )
 
 with torch.device("meta"):
-    config = SelfFlowConfig(**model_config_kwargs)
-    model = SelfFlowCRATE(config)
+    if args.backbone == "gpt":
+        config = SelfFlowGPTConfig(**model_config_kwargs)
+        model = SelfFlowGPT(config)
+    else:
+        config = SelfFlowConfig(**model_config_kwargs)
+        model = SelfFlowCRATE(config)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -236,6 +272,11 @@ if resuming:
     )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data
+
+PRED_TOKEN_ID = None
+if use_jepa:
+    PRED_TOKEN_ID = ensure_pred_token_slot(model, tokenizer, device)
+    model_config_kwargs["vocab_size"] = model.backbone.config.vocab_size
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -420,7 +461,8 @@ teacher_layer_indices = orig_model.teacher_layer_indices
 # ---------------------------------------------------------------------------
 print0(f"\n{'='*60}")
 print0(f"Self-Flow Pretraining")
-print0(f"  Architecture: SelfFlowCRATE d{num_layers} ({num_params:,} params)")
+print0(f"  Backbone: {args.backbone}  |  SelfFlow + EMA  |  JEPA λ={jepa_base_lambda} ({jepa_schedule})" + ("" if use_jepa else " [off]"))
+print0(f"  Architecture: SelfFlow{args.backbone.upper()} d{num_layers} ({num_params:,} params)")
 print0(f"  Student layers: {orig_model.student_layer_indices}")
 print0(f"  Teacher layers: {orig_model.teacher_layer_indices}")
 print0(f"  Corruption: {args.corruption_strategy}")
@@ -472,6 +514,7 @@ while True:
     # --- Save checkpoint ---
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         selfflow_config_dict = {
+            "selfflow_backbone": args.backbone,
             "student_layers": args.student_layers,
             "teacher_layers": args.teacher_layers,
             "proj_hidden_mult": args.proj_hidden_mult,
@@ -552,13 +595,12 @@ while True:
             )
 
             # 3) Teacher forward (uniform cleaner input)
-            from nanochat.crate import norm as crate_norm
             clean_emb_t = ema_model.backbone.transformer.wte(x)
             corrupted_emb_t = corruption.corrupt(
                 clean_emb_t, x, dts.teacher_levels,
                 ema_model.backbone.transformer.wte,
             )
-            corrupted_emb_t = crate_norm(corrupted_emb_t)
+            corrupted_emb_t = flow_norm(corrupted_emb_t)
             if orig_model.use_conditioning:
                 cond_bias_t = ema_model.corruption_conditioner(dts.teacher_levels)
                 corrupted_emb_t = corrupted_emb_t + cond_bias_t
@@ -579,6 +621,24 @@ while True:
             total_loss, metrics = orig_model.compute_selfflow_loss(
                 student_hiddens, teacher_hiddens, lm_loss,
             )
+
+            if use_jepa and PRED_TOKEN_ID is not None:
+                should_jepa = torch.zeros(1, device=device)
+                if master_process:
+                    should_jepa.fill_(1.0 if torch.rand(1).item() >= jepa_dropout else 0.0)
+                if ddp:
+                    dist.broadcast(should_jepa, src=0)
+                if should_jepa.item() > 0.5:
+                    jepa_loss_mean, _ = compute_jepa_loss_for_batch(
+                        orig_model, x, y, PRED_TOKEN_ID, device,
+                        view_min_len=args.jepa_view_min_len, max_view_tokens=256,
+                    )
+                    if jepa_loss_mean is not None:
+                        jepa_lambda_t = get_jepa_lambda(
+                            jepa_base_lambda, step, num_iterations, jepa_schedule,
+                        )
+                        total_loss = total_loss + jepa_lambda_t * jepa_loss_mean
+                        metrics["jepa_loss"] = jepa_loss_mean.item()
 
             # 5) Adversarial loss additions
             adv_loss_val = 0.0
@@ -614,7 +674,7 @@ while True:
                     clean_emb_pgd, x, student_levels,
                     orig_model.backbone.transformer.wte,
                 )
-                base_corrupted = crate_norm(base_corrupted)
+                base_corrupted = flow_norm(base_corrupted)
                 if orig_model.use_conditioning:
                     base_corrupted = base_corrupted + orig_model.corruption_conditioner(student_levels)
 

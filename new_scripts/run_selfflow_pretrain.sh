@@ -1,7 +1,7 @@
 #!/bin/bash
 # Self-Flow pretraining from scratch.
 #
-# Trains a SelfFlowCRATE model with dual-timestep scheduling, pluggable
+# Trains SelfFlowGPT (default) or SelfFlowCRATE (--backbone crate) with dual-timestep scheduling, pluggable
 # corruption, per-token conditioning, and multi-scale representation
 # alignment -- all as first-class training objectives alongside LM loss.
 #
@@ -13,6 +13,7 @@
 set -euo pipefail
 
 WANDB_RUN="${WANDB_RUN:-dummy}"
+BACKBONE="${BACKBONE:-gpt}"
 DEPTH="${DEPTH:-12}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-5000}"
@@ -32,6 +33,7 @@ FORGET_LR="${FORGET_LR:-0.001}"
 
 echo "========================================"
 echo "Self-Flow Pretraining (ground-up)"
+echo "  Backbone: ${BACKBONE}"
 echo "  Depth: ${DEPTH}"
 echo "  Corruption: ${CORRUPTION}"
 echo "  Rep loss: ${REP_LOSS} (weight=${REP_LOSS_WEIGHT})"
@@ -44,6 +46,7 @@ echo "========================================"
 
 python -m scripts.self_flow_pretrain \
     --run "$WANDB_RUN" \
+    --backbone "$BACKBONE" \
     --depth "$DEPTH" \
     --aspect-ratio 64 \
     --head-dim 128 \

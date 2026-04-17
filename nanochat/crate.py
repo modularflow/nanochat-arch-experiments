@@ -15,6 +15,9 @@ designed for use with nanochat's training infrastructure.
 References:
 - CRATE: Yu et al. "White-Box Transformers via Sparse Rate Reduction" (NeurIPS 2023)
 - CRATE-α: Yang et al. "Scaling White-Box Transformers for Vision" (NeurIPS 2024)
+
+Deprecated for new pretraining in this repo: use ``nanochat.gpt`` instead. CRATE is retained for
+loading existing checkpoints, SelfFlow / inspector tooling, and No-Q CRATE experiments.
 """
 
 from functools import partial

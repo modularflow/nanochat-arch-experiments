@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pretrain a d20 CRATE model up to step 5000.
+# Pretrain a d20 vanilla GPT (nanochat.gpt) up to step 5000.
 #
 # Usage:
 #   bash run_pretrain_d20.sh

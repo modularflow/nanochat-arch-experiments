@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -412,7 +413,20 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction="mean",
+        return_hidden_at: Optional[Union[int, List[int]]] = None,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ):
+        """
+        Args:
+            return_hidden_at: Layer index (or list) at which to snapshot pre-head hidden states.
+            embedding_bias: Optional [B, T, d] added after embedding RMSNorm (Self-Flow conditioning).
+        """
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -426,10 +440,25 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        if embedding_bias is not None:
+            x = x + embedding_bias
         x0 = x  # save initial normalized embedding for x0 residual
+
+        if return_hidden_at is not None:
+            multi_layer = isinstance(return_hidden_at, (list, tuple))
+            target_layers = set(return_hidden_at) if multi_layer else {return_hidden_at}
+            hidden_snapshots: Dict[int, torch.Tensor] = {}
+        else:
+            multi_layer = False
+            target_layers = set()
+            hidden_snapshots = {}
+
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+            if i in target_layers:
+                hidden_snapshots[i] = x
+
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -440,13 +469,21 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
+            output = loss
         else:
-            # inference: just return the logits directly
-            return logits
+            output = logits
+
+        if return_hidden_at is not None:
+            if multi_layer:
+                return output, hidden_snapshots
+            return output, hidden_snapshots.get(return_hidden_at)
+        return output
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

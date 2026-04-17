@@ -237,6 +237,25 @@ class RYSGPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
+    def forward_to_final_hidden(self, idx):
+        """Full effective-depth forward returning the final hidden state (before lm_head).
+
+        Used by JEPA to get a representation that respects the RYS layer map,
+        rather than iterating only over the unique physical blocks.
+        """
+        B, T = idx.size()
+        assert T <= self.cos.size(1)
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        for eff_i in range(self.config.n_layer):
+            phys_i = self._layer_map[eff_i]
+            block = self.transformer.h[phys_i]
+            x = self.resid_lambdas[eff_i] * x + self.x0_lambdas[eff_i] * x0
+            x = block(x, cos_sin, self.window_sizes[eff_i], None)
+        return norm(x)
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1)
