@@ -29,6 +29,7 @@ from nanochat.noq_crate import NoQCRATE, NoQCRATEConfig
 from nanochat.rys_gpt import RYSGPT, RYSGPTConfig
 from nanochat.trm_gpt import TRMGPT, TRMGPTConfig
 from nanochat.tpa_gpt import TPAGPT, TPAGPTConfig
+from nanochat.svd_gpt import SVDGPT, SVDGPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -52,15 +53,21 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
-parser.add_argument("--architecture", type=str, default="gpt", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt", "tpa_gpt"],
+parser.add_argument("--architecture", type=str, default="gpt", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt", "tpa_gpt", "svd_gpt"],
     help="Backbone: gpt (default), or crate (deprecated — worse empirical results; kept for legacy checkpoints), "
-         "noq_gpt, noq_crate, rys_gpt, trm_gpt, tpa_gpt (Tensor Product Attention, arXiv:2501.06425)")
+         "noq_gpt, noq_crate, rys_gpt, trm_gpt, tpa_gpt (Tensor Product Attention, arXiv:2501.06425), "
+         "svd_gpt (globally-shared asymmetric SVD attention; single-headed with head_dim == rank).")
 parser.add_argument("--tpa-rank-q", type=int, default=6,
     help="TPA: rank of the Q tensor-product factorization (paper default: == n_head for full Q expressiveness).")
 parser.add_argument("--tpa-rank-k", type=int, default=2,
     help="TPA: rank of the K tensor-product factorization (paper default: 2 — gives the KV-cache compression).")
 parser.add_argument("--tpa-rank-v", type=int, default=2,
     help="TPA: rank of the V tensor-product factorization (paper default: 2).")
+parser.add_argument("--svd-rank", type=int, default=64,
+    help="SVD: rank of the globally-shared Uq/Uk/Uv bases. Also sets head_dim (single-headed). "
+         "Default 64 matches the SVD spec.")
+parser.add_argument("--svd-d-ff", type=int, default=0,
+    help="SVD: SwiGLU FFN hidden size. 0 = auto (round(8 * n_embd / 3 / 8) * 8).")
 parser.add_argument("--rys-block-start", type=int, default=3, help="RYS: first unique block in repeated section (inclusive)")
 parser.add_argument("--rys-block-end", type=int, default=6, help="RYS: end of repeated section (exclusive)")
 parser.add_argument("--rys-num-repeats", type=int, default=2, help="RYS: times the middle block is traversed")
@@ -197,6 +204,12 @@ else:
             "TPA expresses GQA-style KV compression via --tpa-rank-k / --tpa-rank-v instead "
             "(see TPA paper §3.4 — GQA is the rank-G non-contextual case of TPA)."
         )
+    if num_kv_heads < num_heads and args.architecture == "svd_gpt":
+        raise ValueError(
+            "Grouped-Query Attention (--num-kv-heads < num_heads) is not supported for --architecture svd_gpt. "
+            "SVD attention is single-headed (head_dim == --svd-rank); KV compression is a function "
+            "of --svd-rank, not of the KV-head count."
+        )
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
@@ -267,6 +280,16 @@ if args.architecture == "tpa_gpt":
         tpa_rank_k=args.tpa_rank_k,
         tpa_rank_v=args.tpa_rank_v,
     )
+if args.architecture == "svd_gpt":
+    # SVD is single-headed by construction (head_dim == rank). Overwrite the
+    # CLI-inferred head counts so the config we save + re-load is internally
+    # consistent and clearly documents the single-head choice.
+    model_config_kwargs.update(
+        n_head=1,
+        n_kv_head=1,
+        rank=args.svd_rank,
+        d_ff=args.svd_d_ff,
+    )
 # --parallel-residual is only defined on nanochat.gpt.GPTConfig (the two-lane forward lives in GPT.forward).
 if args.parallel_residual:
     if args.architecture != "gpt":
@@ -282,6 +305,7 @@ model_class, model_config_class = {
     "rys_gpt": (RYSGPT, RYSGPTConfig),
     "trm_gpt": (TRMGPT, TRMGPTConfig),
     "tpa_gpt": (TPAGPT, TPAGPTConfig),
+    "svd_gpt": (SVDGPT, SVDGPTConfig),
 }[args.architecture]
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
@@ -359,12 +383,12 @@ _setup_kwargs = dict(
     adam_betas=adam_betas,
     scalar_lr=args.scalar_lr * batch_lr_scale,
 )
-# Only architectures whose setup_optimizers accepts muon_mode get the kwarg (gpt + rys_gpt + tpa_gpt for now).
-if args.architecture in ("gpt", "rys_gpt", "tpa_gpt"):
+# Only architectures whose setup_optimizers accepts muon_mode get the kwarg (gpt + rys_gpt + tpa_gpt + svd_gpt for now).
+if args.architecture in ("gpt", "rys_gpt", "tpa_gpt", "svd_gpt"):
     _setup_kwargs["muon_mode"] = args.muon_mode
 elif args.muon_mode != "default":
     raise ValueError(
-        f"--muon-mode {args.muon_mode!r} is only supported for --architecture gpt, rys_gpt, or tpa_gpt; "
+        f"--muon-mode {args.muon_mode!r} is only supported for --architecture gpt, rys_gpt, tpa_gpt, or svd_gpt; "
         f"got {args.architecture!r}."
     )
 optimizers = model.setup_optimizers(**_setup_kwargs)
