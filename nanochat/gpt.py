@@ -53,6 +53,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
+    # Two-lane "parallel residual" forward (GPT-J-style with a learned 2x2 lane mixer).
+    # Attention reads lane-A, MLP reads lane-B; outputs are mixed back via a 2x2 matrix.
+    parallel_residual: bool = False
 
 
 class KVCache:
@@ -201,12 +204,19 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
+    def attn_out(self, x, cos_sin, window_size, kv_cache):
+        return self.attn(norm(x), cos_sin, window_size, kv_cache)
+
+    def mlp_out(self, x):
+        return self.mlp(norm(x))
+
     def forward(self, x, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn_out(x, cos_sin, window_size, kv_cache)
+        x = x + self.mlp_out(x)
         return x
 
 
@@ -239,6 +249,15 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        # Parallel residual: 2-lane forward with a learned 2x2 lane mixer per block.
+        # post_lambdas init = identity ⇒ at init each lane carries its own attn/mlp output back.
+        # parallel_resid_lambdas init = 1 ⇒ no scaling on the lanes themselves.
+        self.parallel_residual = bool(getattr(config, "parallel_residual", False))
+        if self.parallel_residual:
+            # (n_layer, 2, 2) — mixes (attn_out, mlp_out) into (lane_a, lane_b)
+            self.parallel_post_lambdas = nn.Parameter(torch.zeros(config.n_layer, 2, 2))
+            # (n_layer, 2) — per-lane scaling on the *input* lane before attn/mlp reads it
+            self.parallel_resid_lambdas = nn.Parameter(torch.ones(config.n_layer, 2))
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -283,6 +302,14 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
             self.x0_lambdas.fill_(0.0)      # 0.0 => skip connection to input is disabled at init
+
+        if self.parallel_residual:
+            with torch.no_grad():
+                # post_lambdas = identity 2x2 ⇒ lane A receives attn_out, lane B receives mlp_out
+                self.parallel_post_lambdas.zero_()
+                self.parallel_post_lambdas[:, 0, 0] = 1.0
+                self.parallel_post_lambdas[:, 1, 1] = 1.0
+                self.parallel_resid_lambdas.fill_(1.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -355,8 +382,10 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
+        # Exclude non-matmul params: embeddings and per-layer scalars.
         nparams_exclude = self.transformer.wte.weight.numel() + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        if getattr(self, "parallel_residual", False):
+            nparams_exclude += self.parallel_post_lambdas.numel() + self.parallel_resid_lambdas.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -379,17 +408,30 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         return nparams
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, muon_mode="default"):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 5 groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas)
-        matrix_params = list(self.transformer.h.parameters())
+        # Separate out all parameters into groups.
+        # Muon is for 2D matrix weights inside transformer blocks (Linear weights).
+        # AdamW handles embeddings, lm_head, and all 1D / small scalar params (lambdas, scales, gains).
+        block_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in block_params if p.ndim == 2]
+        small_block_params = [p for p in block_params if p.ndim != 2]
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params)
-        # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
+        # Parallel-residual trunk-level small params go to AdamW with the small_block group.
+        if self.parallel_residual:
+            small_block_params.append(self.parallel_post_lambdas)
+            small_block_params.append(self.parallel_resid_lambdas)
+        accounted = (
+            len(matrix_params) + len(small_block_params)
+            + len(embedding_params) + len(lm_head_params)
+            + len(resid_params) + len(x0_params)
+        )
+        assert accounted == len(list(self.parameters())), \
+            f"Param routing accounted={accounted} vs total={len(list(self.parameters()))}"
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -399,11 +441,14 @@ class GPT(nn.Module):
             dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
             dict(params=x0_params, lr=scalar_lr),
         ]
+        if small_block_params:
+            # Per-block scales / gains / mix vectors. Use the same conservative LR as resid_lambdas.
+            adam_groups.append(dict(params=small_block_params, lr=scalar_lr * 0.01))
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay, mode=muon_mode)
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
@@ -453,11 +498,40 @@ class GPT(nn.Module):
             target_layers = set()
             hidden_snapshots = {}
 
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            x = block(x, cos_sin, self.window_sizes[i], kv_cache)
-            if i in target_layers:
-                hidden_snapshots[i] = x
+        if self.parallel_residual:
+            # Two-lane GPT-J-style residual.
+            # Lane A feeds attention; lane B feeds MLP. After each block the two outputs are
+            # remixed via a learned 2x2 (init=identity ⇒ each lane just gets its own contribution).
+            x_a = x
+            x_b = x
+            for i, block in enumerate(self.transformer.h):
+                # Pre-block mix of (lane, x0) via the scalar resid/x0 lambdas applied symmetrically to both lanes.
+                x_a = self.resid_lambdas[i] * x_a + self.x0_lambdas[i] * x0
+                x_b = self.resid_lambdas[i] * x_b + self.x0_lambdas[i] * x0
+                # Per-lane scale on the *input* lane (init 1.0).
+                lam = self.parallel_resid_lambdas[i].to(x_a.dtype)
+                x_a = x_a * lam[0]
+                x_b = x_b * lam[1]
+                # Compute attn from lane A and MLP from lane B.
+                attn_out = block.attn_out(x_a, cos_sin, self.window_sizes[i], kv_cache)
+                mlp_out = block.mlp_out(x_b)
+                # Remix outputs into the two lanes via the learned 2x2.
+                P = self.parallel_post_lambdas[i].to(x_a.dtype)  # (2, 2)
+                x_a_new = x_a + P[0, 0] * attn_out + P[0, 1] * mlp_out
+                x_b_new = x_b + P[1, 0] * attn_out + P[1, 1] * mlp_out
+                x_a, x_b = x_a_new, x_b_new
+                if i in target_layers:
+                    # For the JEPA / hidden-snapshot path, we need a single representation.
+                    # Average the two lanes — symmetric and parameter-free.
+                    hidden_snapshots[i] = 0.5 * (x_a + x_b)
+            # Collapse the two lanes back into a single stream for the head.
+            x = 0.5 * (x_a + x_b)
+        else:
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+                if i in target_layers:
+                    hidden_snapshots[i] = x
 
         x = norm(x)
 

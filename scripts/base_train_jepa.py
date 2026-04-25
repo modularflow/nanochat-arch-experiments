@@ -28,6 +28,7 @@ from nanochat.noq_gpt import NoQGPT, NoQGPTConfig
 from nanochat.noq_crate import NoQCRATE, NoQCRATEConfig
 from nanochat.rys_gpt import RYSGPT, RYSGPTConfig
 from nanochat.trm_gpt import TRMGPT, TRMGPTConfig
+from nanochat.tpa_gpt import TPAGPT, TPAGPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -51,15 +52,35 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
-parser.add_argument("--architecture", type=str, default="gpt", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt"],
+parser.add_argument("--architecture", type=str, default="gpt", choices=["crate", "gpt", "noq_gpt", "noq_crate", "rys_gpt", "trm_gpt", "tpa_gpt"],
     help="Backbone: gpt (default), or crate (deprecated — worse empirical results; kept for legacy checkpoints), "
-         "noq_gpt, noq_crate, rys_gpt, trm_gpt")
+         "noq_gpt, noq_crate, rys_gpt, trm_gpt, tpa_gpt (Tensor Product Attention, arXiv:2501.06425)")
+parser.add_argument("--tpa-rank-q", type=int, default=6,
+    help="TPA: rank of the Q tensor-product factorization (paper default: == n_head for full Q expressiveness).")
+parser.add_argument("--tpa-rank-k", type=int, default=2,
+    help="TPA: rank of the K tensor-product factorization (paper default: 2 — gives the KV-cache compression).")
+parser.add_argument("--tpa-rank-v", type=int, default=2,
+    help="TPA: rank of the V tensor-product factorization (paper default: 2).")
 parser.add_argument("--rys-block-start", type=int, default=3, help="RYS: first unique block in repeated section (inclusive)")
 parser.add_argument("--rys-block-end", type=int, default=6, help="RYS: end of repeated section (exclusive)")
 parser.add_argument("--rys-num-repeats", type=int, default=2, help="RYS: times the middle block is traversed")
 parser.add_argument("--rys-blocks", type=str, default="", help="RYS multi-block: 'start1,end1;start2,end2;...' (overrides single-block params)")
+parser.add_argument("--rys-frac-recur-start", type=float, default=0.0,
+    help="RYS: fraction of training (0.0-1.0) before recurrence activates. "
+         "0 (default) = recurrence always on. e.g. 0.35 disables recurrence for the first 35%% of steps.")
 parser.add_argument("--trm-n-recur", type=int, default=6, help="TRM: recursions per cycle (each traverses all unique blocks)")
 parser.add_argument("--trm-T-cycles", type=int, default=3, help="TRM: total recursion cycles (T-1 without grad during training)")
+parser.add_argument("--parallel-residual", action="store_true",
+    help="GPT: GPT-J-style 2-lane residual; attn reads lane A, MLP reads lane B, mixed via learned 2x2.")
+# MuonEqR optimizer mode (parameter-golf SOTA recipe).
+parser.add_argument("--muon-mode", type=str, default="default", choices=["default", "eqr"],
+    help="Muon variant: 'default' (NorMuon variance reduction + cautious WD) or 'eqr' "
+         "(parameter-golf MuonEqR: row-normalize gradient before NS, decoupled WD, no var-reduction).")
+# EMA shadow weights (saved alongside the regular checkpoint, evaluated on val).
+parser.add_argument("--ema-decay", type=float, default=0.0,
+    help="Per-step EMA decay for a shadow copy of model weights (0 = disabled). 0.997 ≈ 333-step half-life.")
+parser.add_argument("--ema-warmup-steps", type=int, default=100,
+    help="When --ema-decay > 0, hard-copy weights for the first N steps before EMA kicks in.")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -120,6 +141,10 @@ jepa_schedule = args.jepa_schedule
 jepa_dropout = args.jepa_dropout
 use_jepa = jepa_base_lambda > 0.0
 assert 0.0 <= jepa_dropout <= 1.0
+# EMA bookkeeping
+ema_decay = float(args.ema_decay)
+use_ema = ema_decay > 0.0
+assert 0.0 <= ema_decay < 1.0, f"--ema-decay must be in [0, 1), got {ema_decay}"
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -165,6 +190,12 @@ else:
         raise ValueError(
             "Grouped-Query Attention (--num-kv-heads < num_heads) is not supported for CRATE/NoQCRATE "
             "(tied QKV). Use --architecture gpt, noq_gpt, rys_gpt, or trm_gpt."
+        )
+    if num_kv_heads < num_heads and args.architecture == "tpa_gpt":
+        raise ValueError(
+            "Grouped-Query Attention (--num-kv-heads < num_heads) is not supported for --architecture tpa_gpt. "
+            "TPA expresses GQA-style KV compression via --tpa-rank-k / --tpa-rank-v instead "
+            "(see TPA paper §3.4 — GQA is the rank-G non-contextual case of TPA)."
         )
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
@@ -228,6 +259,21 @@ if args.architecture == "rys_gpt":
     model_config_kwargs.update(rys_block_start=args.rys_block_start, rys_block_end=args.rys_block_end, rys_num_repeats=args.rys_num_repeats)
     if args.rys_blocks:
         model_config_kwargs["rys_blocks"] = args.rys_blocks
+    if args.rys_frac_recur_start > 0.0:
+        model_config_kwargs["frac_recur_start"] = args.rys_frac_recur_start
+if args.architecture == "tpa_gpt":
+    model_config_kwargs.update(
+        tpa_rank_q=args.tpa_rank_q,
+        tpa_rank_k=args.tpa_rank_k,
+        tpa_rank_v=args.tpa_rank_v,
+    )
+# --parallel-residual is only defined on nanochat.gpt.GPTConfig (the two-lane forward lives in GPT.forward).
+if args.parallel_residual:
+    if args.architecture != "gpt":
+        raise ValueError(
+            f"--parallel-residual is only supported for --architecture gpt; got {args.architecture!r}."
+        )
+    model_config_kwargs["parallel_residual"] = True
 model_class, model_config_class = {
     "crate": (CRATE, CRATEConfig),
     "gpt": (GPT, GPTConfig),
@@ -235,6 +281,7 @@ model_class, model_config_class = {
     "noq_crate": (NoQCRATE, NoQCRATEConfig),
     "rys_gpt": (RYSGPT, RYSGPTConfig),
     "trm_gpt": (TRMGPT, TRMGPTConfig),
+    "tpa_gpt": (TPAGPT, TPAGPTConfig),
 }[args.architecture]
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
@@ -304,7 +351,7 @@ if resuming and args.resume_from_step >= num_iterations:
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
 adam_betas = (args.adam_beta1, args.adam_beta2)
-optimizers = model.setup_optimizers(
+_setup_kwargs = dict(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     matrix_lr=args.matrix_lr * batch_lr_scale,
@@ -312,12 +359,61 @@ optimizers = model.setup_optimizers(
     adam_betas=adam_betas,
     scalar_lr=args.scalar_lr * batch_lr_scale,
 )
+# Only architectures whose setup_optimizers accepts muon_mode get the kwarg (gpt + rys_gpt + tpa_gpt for now).
+if args.architecture in ("gpt", "rys_gpt", "tpa_gpt"):
+    _setup_kwargs["muon_mode"] = args.muon_mode
+elif args.muon_mode != "default":
+    raise ValueError(
+        f"--muon-mode {args.muon_mode!r} is only supported for --architecture gpt, rys_gpt, or tpa_gpt; "
+        f"got {args.architecture!r}."
+    )
+optimizers = model.setup_optimizers(**_setup_kwargs)
 adamw_optimizer, muon_optimizer = optimizers
 
 if resuming:
     for opt, dat in zip(optimizers, optimizer_data):
         opt.load_state_dict(dat)
     del optimizer_data # free up the memory
+
+# -----------------------------------------------------------------------------
+# EMA shadow weights (parameter-golf trick): keep a running exponential moving
+# average of the model parameters, evaluate val/bpb_ema alongside val/bpb, and
+# save it as model_ema_<step>.pt next to the regular checkpoint.
+ema_state = None  # name -> tensor (same dtype as the live param)
+def _ema_named_params():
+    """Iterate over (name, param) of the original (uncompiled) model.
+    Strip torch.compile's `_orig_mod.` prefix that appears on the compiled wrapper."""
+    for name, p in orig_model.named_parameters():
+        yield name, p
+def _init_ema():
+    global ema_state
+    ema_state = {name: p.detach().clone() for name, p in _ema_named_params()}
+    print0(f"EMA: initialized shadow with {sum(t.numel() for t in ema_state.values()):,} params (decay={ema_decay})")
+def _update_ema(decay_now):
+    if ema_state is None:
+        return
+    with torch.no_grad():
+        for name, p in _ema_named_params():
+            shadow = ema_state[name]
+            shadow.mul_(decay_now).add_(p.detach().to(shadow.dtype), alpha=1.0 - decay_now)
+def _swap_in_ema():
+    """Swap live params with EMA. Returns dict of saved live tensors for restoration."""
+    if ema_state is None:
+        return None
+    saved = {}
+    with torch.no_grad():
+        for name, p in _ema_named_params():
+            saved[name] = p.detach().clone()
+            p.data.copy_(ema_state[name].to(p.dtype))
+    return saved
+def _swap_out_ema(saved):
+    if saved is None:
+        return
+    with torch.no_grad():
+        for name, p in _ema_named_params():
+            p.data.copy_(saved[name])
+if use_ema:
+    _init_ema()
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -389,12 +485,24 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        log_eval = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        # Same eval pass with EMA-swapped weights so we can compare raw vs. EMA representations.
+        if use_ema and ema_state is not None:
+            ema_saved = _swap_in_ema()
+            try:
+                val_loader_ema = build_val_loader()
+                with autocast_ctx:
+                    val_bpb_ema = evaluate_bpb(model, val_loader_ema, eval_steps, token_bytes)
+                print0(f"Step {step:05d} | Validation bpb (EMA): {val_bpb_ema:.6f}")
+                log_eval["val/bpb_ema"] = val_bpb_ema
+            finally:
+                _swap_out_ema(ema_saved)
+        wandb_run.log(log_eval)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -458,6 +566,11 @@ while True:
             },
             rank=ddp_rank,
         )
+        # Also save EMA shadow weights (same dict layout as model state_dict, master rank only).
+        if use_ema and master_process and ema_state is not None:
+            ema_path = os.path.join(checkpoint_dir, f"model_ema_{step:06d}.pt")
+            torch.save(ema_state, ema_path)
+            print0(f"EMA: saved shadow weights to {ema_path}")
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -465,6 +578,9 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # Tell the model where it is in training (used by RYS fractional recurrence).
+    if hasattr(orig_model, "set_training_progress"):
+        orig_model.set_training_progress(step / max(1, num_iterations))
     # evaluate the gradient
     synchronize()
     t0 = time.time()
@@ -512,6 +628,14 @@ while True:
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    # Update EMA shadow weights AFTER the optimizer step.
+    if use_ema:
+        # Hard-copy during the warmup window so EMA doesn't lag the rapidly-changing init weights.
+        if step < args.ema_warmup_steps:
+            decay_now = 0.0  # → shadow := live params
+        else:
+            decay_now = ema_decay
+        _update_ema(decay_now)
     synchronize()
     t1 = time.time()
     dt = t1 - t0

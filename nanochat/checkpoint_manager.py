@@ -65,6 +65,11 @@ def _uses_noq_gpt_architecture(model_data):
     has_mssa = any(".mssa." in key or ".kv." in key for key in model_data.keys())
     return has_ck and not has_cq and not has_mssa
 
+def _uses_tpa_gpt_architecture(model_data):
+    # TPA-GPT exposes per-side rank-factorized projections: W_aQ / W_bQ / W_aK / W_bK / W_aV / W_bV.
+    # The W_aQ marker is unique across all architectures in this repo.
+    return any(".W_aQ." in key for key in model_data.keys())
+
 def _uses_noq_crate_architecture(model_data):
     # No-Q CRATE uses .mssa.kv. (not .mssa.qkv.) alongside ODL/ISTA blocks.
     has_mssa_kv = any(".mssa.kv." in key for key in model_data.keys())
@@ -198,6 +203,10 @@ def build_model(checkpoint_dir, step, device, phase):
         from nanochat.noq_gpt import NoQGPT, NoQGPTConfig
         model_class, model_config_class = NoQGPT, NoQGPTConfig
         arch_name = "NoQGPT"
+    elif _uses_tpa_gpt_architecture(model_data):
+        from nanochat.tpa_gpt import TPAGPT, TPAGPTConfig
+        model_class, model_config_class = TPAGPT, TPAGPTConfig
+        arch_name = "TPAGPT"
     else:
         model_class, model_config_class = GPT, GPTConfig
         arch_name = "GPT"

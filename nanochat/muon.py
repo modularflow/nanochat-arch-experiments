@@ -46,6 +46,18 @@ def zeropower_via_polar_express(G: Tensor, steps: int = 5) -> Tensor:
 
 
 @torch.compile
+def row_normalize(G: Tensor, eps: float = 1e-7) -> Tensor:
+    """
+    Row-normalize a 2D gradient: divide each row by its L2 norm.
+    This is the gradient-shaping step in parameter-golf's MuonEqR variant.
+    Applied BEFORE the orthogonalization iteration so each row enters Newton-Schulz
+    with unit length, which empirically gives a more uniform spectrum after NS.
+    """
+    row_norms = G.float().norm(dim=-1, keepdim=True).clamp_min(eps)
+    return (G.float() / row_norms).to(G.dtype)
+
+
+@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -131,9 +143,14 @@ class Muon(torch.optim.Optimizer):
         ns_steps: The number of Newton-Schulz iteration steps to use.
         beta2: The decay rate for the second moment (variance) estimate. Set to None to disable.
         weight_decay: Cautious weight decay coefficient. Only decays where update and weight agree.
+        mode: "default" (current nanochat Muon, with NorMuon variance reduction + cautious WD) or
+              "eqr" (parameter-golf MuonEqR: row-normalize before Newton-Schulz, then decoupled WD).
+              In "eqr" mode the variance-reduction branch is bypassed and WD is decoupled (always
+              applied), matching the parameter-golf SOTA recipe.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, beta2=0.95, weight_decay=0.0):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, beta2=beta2, weight_decay=weight_decay)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, beta2=0.95, weight_decay=0.0, mode="default"):
+        assert mode in ("default", "eqr"), f"Muon mode must be 'default' or 'eqr', got {mode!r}"
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, beta2=beta2, weight_decay=weight_decay, mode=mode)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -145,6 +162,7 @@ class Muon(torch.optim.Optimizer):
     def step(self):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
+            mode = group.get("mode", "default")
             for p in params:
                 g = p.grad
                 if g is None:
@@ -157,24 +175,36 @@ class Muon(torch.optim.Optimizer):
                 buf: Tensor = state["momentum_buffer"]
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_polar_express(g, steps=group["ns_steps"])
-                # Variance reduction (NorMuon-style)
-                if group["beta2"] is not None:
-                    if "second_momentum_buffer" not in state:
-                        # Buffer shape determines reduction dim: reduce along larger dimension
-                        if p.size(-2) >= p.size(-1):
-                            state["second_momentum_buffer"] = torch.zeros_like(g[..., :1])
-                        else:
-                            state["second_momentum_buffer"] = torch.zeros_like(g[..., :1, :])
-                    g = apply_variance_reduction(g, state["second_momentum_buffer"], group["beta2"])
-                # Parameter update with cautious weight decay
-                effective_lr = group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5
-                wd = group["weight_decay"]
-                if wd != 0:
-                    mask = (g * p) >= 0
-                    p.sub_(effective_lr * g + effective_lr * wd * p * mask)
-                else:
+                if mode == "eqr":
+                    # Parameter-golf MuonEqR: row-normalize gradient → Newton-Schulz → aspect scale
+                    # → decoupled weight decay. NorMuon variance reduction is bypassed.
+                    g = row_normalize(g)
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                    effective_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5
+                    wd = group["weight_decay"]
+                    if wd != 0:
+                        # Decoupled weight decay: shrink param BEFORE the gradient step.
+                        p.data.mul_(1.0 - effective_lr * wd)
                     p.sub_(effective_lr * g)
+                else:
+                    g = zeropower_via_polar_express(g, steps=group["ns_steps"])
+                    # Variance reduction (NorMuon-style)
+                    if group["beta2"] is not None:
+                        if "second_momentum_buffer" not in state:
+                            # Buffer shape determines reduction dim: reduce along larger dimension
+                            if p.size(-2) >= p.size(-1):
+                                state["second_momentum_buffer"] = torch.zeros_like(g[..., :1])
+                            else:
+                                state["second_momentum_buffer"] = torch.zeros_like(g[..., :1, :])
+                        g = apply_variance_reduction(g, state["second_momentum_buffer"], group["beta2"])
+                    # Parameter update with cautious weight decay
+                    effective_lr = group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5
+                    wd = group["weight_decay"]
+                    if wd != 0:
+                        mask = (g * p) >= 0
+                        p.sub_(effective_lr * g + effective_lr * wd * p * mask)
+                    else:
+                        p.sub_(effective_lr * g)
 
 
 class DistMuon(torch.optim.Optimizer):
@@ -201,8 +231,10 @@ class DistMuon(torch.optim.Optimizer):
         weight_decay: Cautious weight decay coefficient. Only decays where update and weight agree.
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 nesterov: bool = True, ns_steps: int = 5, beta2: float = 0.95, weight_decay: float = 0.0):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, beta2=beta2, weight_decay=weight_decay)
+                 nesterov: bool = True, ns_steps: int = 5, beta2: float = 0.95, weight_decay: float = 0.0,
+                 mode: str = "default"):
+        assert mode in ("default", "eqr"), f"DistMuon mode must be 'default' or 'eqr', got {mode!r}"
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, beta2=beta2, weight_decay=weight_decay, mode=mode)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
         rank = dist.get_rank()
@@ -272,24 +304,35 @@ class DistMuon(torch.optim.Optimizer):
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1.0 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_polar_express(g, steps=group["ns_steps"])
-                    # Variance reduction (NorMuon-style)
-                    if group["beta2"] is not None:
-                        if "second_momentum_buffer" not in state:
-                            # Buffer shape determines reduction dim: reduce along larger dimension
-                            if p.size(-2) >= p.size(-1):
-                                state["second_momentum_buffer"] = torch.zeros_like(g[..., :1])
-                            else:
-                                state["second_momentum_buffer"] = torch.zeros_like(g[..., :1, :])
-                        g = apply_variance_reduction(g, state["second_momentum_buffer"], group["beta2"])
-                    # Parameter update with cautious weight decay
-                    effective_lr = group["lr"] * (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
-                    wd = group["weight_decay"]
-                    if wd != 0:
-                        mask = (g * p) >= 0
-                        p.sub_(effective_lr * g + effective_lr * wd * p * mask)
-                    else:
+                    mode = group.get("mode", "default")
+                    if mode == "eqr":
+                        # Parameter-golf MuonEqR
+                        g = row_normalize(g)
+                        g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                        effective_lr = group["lr"] * (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
+                        wd = group["weight_decay"]
+                        if wd != 0:
+                            p.data.mul_(1.0 - effective_lr * wd)
                         p.sub_(effective_lr * g)
+                    else:
+                        g = zeropower_via_polar_express(g, steps=group["ns_steps"])
+                        # Variance reduction (NorMuon-style)
+                        if group["beta2"] is not None:
+                            if "second_momentum_buffer" not in state:
+                                # Buffer shape determines reduction dim: reduce along larger dimension
+                                if p.size(-2) >= p.size(-1):
+                                    state["second_momentum_buffer"] = torch.zeros_like(g[..., :1])
+                                else:
+                                    state["second_momentum_buffer"] = torch.zeros_like(g[..., :1, :])
+                            g = apply_variance_reduction(g, state["second_momentum_buffer"], group["beta2"])
+                        # Parameter update with cautious weight decay
+                        effective_lr = group["lr"] * (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
+                        wd = group["weight_decay"]
+                        if wd != 0:
+                            mask = (g * p) >= 0
+                            p.sub_(effective_lr * g + effective_lr * wd * p * mask)
+                        else:
+                            p.sub_(effective_lr * g)
                 # Replicate updated parameters to all ranks
                 ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer
                 ag_output = params[base_i:base_i + world_size]

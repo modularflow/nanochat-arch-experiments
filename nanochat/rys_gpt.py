@@ -69,6 +69,11 @@ class RYSGPTConfig:
     # Multi-block config (overrides single-block when set)
     # Format: "start1,end1;start2,end2;..." - each block repeated once
     rys_blocks: str = ""
+    # Fractional-activation recurrence (parameter-golf trick).
+    # If frac_recur_start > 0.0, recurrence is OFF for the first frac_recur_start of training
+    # (forward only traverses each unique block once, capped at n_unique layers).
+    # The training script must call model.set_training_progress(step / num_iterations).
+    frac_recur_start: float = 0.0
 
     @property
     def n_unique_layers(self):
@@ -113,6 +118,14 @@ class RYSGPT(nn.Module):
         assert len(layer_map) == config.n_layer, \
             f"Layer map length {len(layer_map)} != n_layer {config.n_layer}"
         self._layer_map = layer_map  # Python list for use in forward/flops (avoids meta tensor issues)
+        # Pre-recurrence "warmup" map: traverse each unique block exactly once.
+        # Used for the first `frac_recur_start` fraction of training when that flag is set.
+        self._flat_layer_map = list(range(self.config.n_unique_layers))
+        self.frac_recur_start = float(getattr(config, "frac_recur_start", 0.0))
+        # Updated externally by base_train_jepa via set_training_progress().
+        # Stored as a boolean (not a per-step float) so torch.compile sees a guard
+        # that only flips once over the whole run instead of recompiling every step.
+        self._recurrence_active = self.frac_recur_start <= 0.0
         self.register_buffer('rys_layer_map', torch.tensor(layer_map, dtype=torch.long))
 
         # Per-effective-layer window sizes
@@ -191,6 +204,22 @@ class RYSGPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def set_training_progress(self, frac):
+        """Externally tell the model where we are in training (0.0 → 1.0).
+        When frac_recur_start > 0, recurrence is disabled while frac < frac_recur_start.
+
+        Only mutates state when the recurrence-active boolean actually flips, so
+        torch.compile recompiles at most once over the whole run (instead of on
+        every step, which would otherwise blow past the dynamo recompile limit
+        and silently fall back to eager).
+        """
+        active = (self.frac_recur_start <= 0.0) or (float(frac) >= self.frac_recur_start)
+        if active != self._recurrence_active:
+            self._recurrence_active = active
+
+    def _active_layer_map(self):
+        return self._layer_map if self._recurrence_active else self._flat_layer_map
+
     def estimate_flops(self):
         """FLOPs based on effective computation (shared blocks counted per traversal)."""
         block_params = [sum(p.numel() for p in block.parameters()) for block in self.transformer.h]
@@ -208,7 +237,7 @@ class RYSGPT(nn.Module):
         """Unique parameter count (memory footprint)."""
         return sum(p.numel() for p in self.parameters())
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, muon_mode="default"):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         matrix_params = list(self.transformer.h.parameters())
@@ -228,7 +257,7 @@ class RYSGPT(nn.Module):
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay, mode=muon_mode)
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         optimizers = [adamw_optimizer, muon_optimizer]
@@ -249,8 +278,8 @@ class RYSGPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
-        for eff_i in range(self.config.n_layer):
-            phys_i = self._layer_map[eff_i]
+        layer_map = self._active_layer_map()
+        for eff_i, phys_i in enumerate(layer_map):
             block = self.transformer.h[phys_i]
             x = self.resid_lambdas[eff_i] * x + self.x0_lambdas[eff_i] * x0
             x = block(x, cos_sin, self.window_sizes[eff_i], None)
@@ -265,8 +294,8 @@ class RYSGPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
-        for eff_i in range(self.config.n_layer):
-            phys_i = self._layer_map[eff_i]
+        layer_map = self._active_layer_map()
+        for eff_i, phys_i in enumerate(layer_map):
             block = self.transformer.h[phys_i]
             if kv_cache is not None:
                 block.attn.layer_idx = eff_i
