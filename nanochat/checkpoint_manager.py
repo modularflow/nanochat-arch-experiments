@@ -70,6 +70,11 @@ def _uses_tpa_gpt_architecture(model_data):
     # The W_aQ marker is unique across all architectures in this repo.
     return any(".W_aQ." in key for key in model_data.keys())
 
+def _uses_svd_gpt_architecture(model_data):
+    # SVD-GPT registers a unique buffer 'svd_marker' and stores globally-shared
+    # 'Uq' / 'Uk' / 'Uv' at the top level (not inside any block).
+    return 'svd_marker' in model_data or ('Uq' in model_data and 'Uk' in model_data and 'Uv' in model_data)
+
 def _uses_noq_crate_architecture(model_data):
     # No-Q CRATE uses .mssa.kv. (not .mssa.qkv.) alongside ODL/ISTA blocks.
     has_mssa_kv = any(".mssa.kv." in key for key in model_data.keys())
@@ -207,6 +212,10 @@ def build_model(checkpoint_dir, step, device, phase):
         from nanochat.tpa_gpt import TPAGPT, TPAGPTConfig
         model_class, model_config_class = TPAGPT, TPAGPTConfig
         arch_name = "TPAGPT"
+    elif _uses_svd_gpt_architecture(model_data):
+        from nanochat.svd_gpt import SVDGPT, SVDGPTConfig
+        model_class, model_config_class = SVDGPT, SVDGPTConfig
+        arch_name = "SVDGPT"
     else:
         model_class, model_config_class = GPT, GPTConfig
         arch_name = "GPT"

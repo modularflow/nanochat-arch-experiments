@@ -18,7 +18,11 @@
 # TIER B — Same training recipe, different compute graph (still 768 wide where noted):
 #   trm_gpt: 2 unique layers × 384 dim, recursion → NOT same #params or FLOPs/step as Tier A.
 #   rys_gpt: 12 layers with repeated mid-block → NOT same FLOPs/step as plain GPT.
-#   Compare Tier B mainly within {trm, rys} and against Tier A only qualitatively.
+#   svd_gpt: globally-shared asymmetric SVD attention (single-headed, head_dim==rank).
+#           → Attention params are 3 × (rank × n_embd) shared across ALL layers, so the
+#             attention subblock's parameter count is *constant* in depth. FLOPs/step
+#             differ from Tier A.
+#   Compare Tier B mainly within {trm, rys, svd} and against Tier A only qualitatively.
 #
 # TIER C — Self-Flow (different objective than plain CE/JEPA in base_train_jepa):
 #   scripts.self_flow_pretrain — default --backbone gpt (vanilla GPT + rep-alignment + EMA + corruptions).
@@ -142,6 +146,11 @@ if [ "${SKIP_TRM_RYS}" = "0" ]; then
     JEPA_EXPS+=("B|d12-s5k-rys-jepa-lin-4090|rys_gpt|--depth 12 --aspect-ratio 64 --rys-block-start 3 --rys-block-end 6 --rys-num-repeats 2|0.25|linear_decay")
     JEPA_EXPS+=("B|d12-s5k-rys-gqa${NUM_KV_HEADS}-ce-4090|rys_gpt|--depth 12 --aspect-ratio 64 --rys-block-start 3 --rys-block-end 6 --rys-num-repeats 2 --num-kv-heads ${NUM_KV_HEADS}|0|constant")
     JEPA_EXPS+=("B|d12-s5k-rys-gqa${NUM_KV_HEADS}-jepa-lin-4090|rys_gpt|--depth 12 --aspect-ratio 64 --rys-block-start 3 --rys-block-end 6 --rys-num-repeats 2 --num-kv-heads ${NUM_KV_HEADS}|0.25|linear_decay")
+    # Tier B — SVD: globally-shared asymmetric SVD attention, single-headed with head_dim==rank.
+    # 12 × 768 stack, rank=64 matches the SVD spec default.
+    SVD_RANK="${SVD_RANK:-64}"
+    JEPA_EXPS+=("B|d12-s5k-svd-r${SVD_RANK}-ce-4090|svd_gpt|--depth 12 --aspect-ratio 64 --svd-rank ${SVD_RANK}|0|constant")
+    JEPA_EXPS+=("B|d12-s5k-svd-r${SVD_RANK}-jepa-lin-4090|svd_gpt|--depth 12 --aspect-ratio 64 --svd-rank ${SVD_RANK}|0.25|linear_decay")
 fi
 
 run_jepa_exp() {
