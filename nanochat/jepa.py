@@ -20,20 +20,37 @@ from nanochat.common import print0
 PRED_TOKEN_STR = "<|pred|>"
 
 # Supported JEPA lambda schedules
-JEPA_SCHEDULES = ("constant", "linear_decay", "cosine_decay")
+JEPA_SCHEDULES = (
+    "constant",
+    "linear_decay",
+    "cosine_decay",
+    "linear_decay_cyclic",
+    "cosine_decay_cyclic",
+)
 
 
-def get_jepa_lambda(base_lambda, step, total_steps, schedule="constant"):
+def get_jepa_lambda(base_lambda, step, total_steps, schedule="constant", period=None):
     """
     Return the JEPA loss weight at a given training step.
 
     Schedules:
-        constant     - base_lambda throughout training
-        linear_decay - base_lambda → 0 linearly over total_steps
-        cosine_decay - base_lambda → 0 following a cosine half-period
+        constant             - base_lambda throughout training
+        linear_decay         - base_lambda → 0 linearly over total_steps
+        cosine_decay         - base_lambda → 0 following a cosine half-period
+        linear_decay_cyclic  - repeats a linear decay every `period` steps
+                               (period defaults to total_steps if not given).
+                               At step == k*period: lambda == base_lambda;
+                               at step == (k+1)*period - 1: lambda ≈ 0.
+        cosine_decay_cyclic  - repeats a cosine half-period decay every `period` steps.
     """
     if schedule == "constant":
         return base_lambda
+    if schedule in ("linear_decay_cyclic", "cosine_decay_cyclic"):
+        p = int(period) if period is not None and int(period) > 0 else max(int(total_steps), 1)
+        frac = (int(step) % p) / p
+        if schedule == "linear_decay_cyclic":
+            return base_lambda * (1.0 - frac)
+        return base_lambda * 0.5 * (1.0 + math.cos(math.pi * frac))
     frac = min(step / max(total_steps, 1), 1.0)
     if schedule == "linear_decay":
         return base_lambda * (1.0 - frac)
